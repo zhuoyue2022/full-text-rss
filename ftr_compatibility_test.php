@@ -16,18 +16,24 @@ SimplePie.org. We have kept most of their checks intact as we use SimplePie in o
 http://github.com/simplepie/simplepie/tree/master/compatibility_test/
 */
 
-$app_name = 'Full-Text RSS 3.2';
+$app_name = 'Full-Text RSS 3.8';
 
-$php_ok = (function_exists('version_compare') && version_compare(phpversion(), '5.2.0', '>='));
+// Full-Text RSS is not yet compatible with HHVM, that's why we check for it with HHVM_VERSION.
+//$php_ok = (function_exists('version_compare') && version_compare(phpversion(), '5.2.0', '>=') && !defined('HHVM_VERSION'));
+// HHVM works okay, but no Tidy and autoupdate of site config files not working (tested 3.7.1)
+$php_ok = (function_exists('version_compare') && version_compare(phpversion(), '5.4.0', '>='));
 $pcre_ok = extension_loaded('pcre');
 $zlib_ok = extension_loaded('zlib');
 $mbstring_ok = extension_loaded('mbstring');
 $iconv_ok = extension_loaded('iconv');
 $tidy_ok = function_exists('tidy_parse_string');
 $curl_ok = function_exists('curl_exec');
-$parallel_ok = ((extension_loaded('http') && class_exists('HttpRequestPool')) || ($curl_ok && function_exists('curl_multi_init')));
+$parallel_ok = ((extension_loaded('http') && class_exists('http\Client\Request')) || ($curl_ok && function_exists('curl_multi_init')));
 $allow_url_fopen_ok = (bool)ini_get('allow_url_fopen');
 $filter_ok = extension_loaded('filter');
+$gumbo_ok = class_exists('Layershifter\Gumbo\Parser');
+$idn_ok = function_exists('idn_to_ascii');
+$dom_ok = extension_loaded('DOM');
 
 if (extension_loaded('xmlreader')) {
 	$xml_ok = true;
@@ -200,7 +206,7 @@ div.chunk {
 				<tbody>
 					<tr class="<?php echo ($php_ok) ? 'enabled' : 'disabled'; ?>">
 						<td>PHP</td>
-						<td>5.2.0 or higher</td>
+						<td>5.4 or higher</td>
 						<td><?php echo phpversion(); ?></td>
 					</tr>
 					<tr class="<?php echo ($xml_ok) ? 'enabled, and sane' : 'disabled, or broken'; ?>">
@@ -252,7 +258,12 @@ div.chunk {
 						<td><a href="http://www.php.net/manual/en/filesystem.configuration.php#ini.allow-url-fopen">allow_url_fopen</a></td>
 						<td>Enabled</td>
 						<td><?php echo ($allow_url_fopen_ok) ? 'Enabled' : 'Disabled'; ?></td>
-					</tr>						
+					</tr>
+					<tr class="<?php echo ($dom_ok) ? 'enabled' : 'disabled'; ?>">
+						<td><a href="http://php.net/manual/en/book.dom.php">DOM / XML extension</a></td>
+						<td>Enabled</td>
+						<td><?php echo ($dom_ok) ? 'Enabled' : 'Disabled'; ?></td>
+					</tr>	
 				</tbody>
 			</table>
 		</div>
@@ -260,7 +271,7 @@ div.chunk {
 		<div class="chunk">
 			<h3>What does this mean?</h3>
 			<ol>
-				<?php if ($php_ok && $xml_ok && $pcre_ok && $mbstring_ok && $iconv_ok && $filter_ok && $zlib_ok && $tidy_ok && $curl_ok && $parallel_ok && $allow_url_fopen_ok): ?>
+				<?php if ($php_ok && $xml_ok && $pcre_ok && $dom_ok && $mbstring_ok && $iconv_ok && $filter_ok && $zlib_ok && $tidy_ok && $curl_ok && $parallel_ok && $allow_url_fopen_ok): ?>
 				<li>You have everything you need to run <?php echo $app_name; ?> properly!  Congratulations!</li>
 				<?php else: ?>
 					<?php if ($php_ok): ?>
@@ -295,7 +306,7 @@ div.chunk {
 										<?php if ($tidy_ok): ?>
 											<li><strong>Tidy:</strong> You have <code>Tidy</code> support installed.  No problems here.</li>
 										<?php else: ?>
-											<li class="highlight"><strong>Tidy:</strong> The <code>Tidy</code> extension is not available.  <?php echo $app_name; ?> should still work with most feeds/articles, but you may experience problems with some.</li>
+											<li class="highlight"><strong>Tidy:</strong> The <code>Tidy</code> extension is not available.  <?php echo $app_name; ?> should still work with most feeds/articles, but you may experience problems with some. For problem feeds we recommend you use the HTML5 parser.</li>
 										<?php endif; ?>
 										
 										<?php if ($curl_ok): ?>
@@ -305,9 +316,9 @@ div.chunk {
 										<?php endif; ?>
 			
 										<?php if ($parallel_ok): ?>
-											<li><strong>Parallel URL fetching:</strong> You have <code>HttpRequestPool</code> or <code>curl_multi</code> support installed.  No problems here.</li>
+											<li><strong>Parallel URL fetching:</strong> You have PHP's HTTP extension or <code>curl_multi</code> installed.  No problems here.</li>
 										<?php else: ?>
-											<li class="highlight"><strong>Parallel URL fetching:</strong> <code>HttpRequestPool</code> or <code>curl_multi</code> support is not available.  <?php echo $app_name; ?> will use <code>file_get_contents()</code> instead to fetch URLs sequentially rather than in parallel.</li>
+											<li class="highlight"><strong>Parallel URL fetching:</strong> HTTP extension or <code>curl_multi</code> support is not available.  <?php echo $app_name; ?> will use <code>file_get_contents()</code> instead to fetch URLs sequentially rather than in parallel.</li>
 										<?php endif; ?>
 
 									<?php else: ?>
@@ -350,19 +361,24 @@ div.chunk {
 
 		<div class="chunk">
 			<h3>Further info</h3>
+
+			<h4>IDN support</h4>
+			<p>When treating an <a href="https://en.wikipedia.org/wiki/Internationalized_domain_name">internationalized domain name (IDN)</a> Full-Text RSS will try to make use of PHP's <code>idn_to_ascii</code> function to convert the domain to ASCII. If this function does not exist, you might have trouble retrieving article content from internationalized domains.</p>
+			<p class="highlight"><strong>idn_to_ascii</strong> is <?php if (!$idn_ok) echo '<strong>not</strong>'; ?> available on this server.</p>
+
 			<h4>HTTP module</h4>
-			<p>Full-Text RSS can make use of <code>HttpRequestPool</code> or <code>curl_multi</code> to make parallel HTTP requests when processing feeds. If neither are available, it will make sequential requests using <code>file_get_contents</code>.</p>
+			<p>Full-Text RSS can make use of PHP's HTTP extension or <code>curl_multi</code> to make parallel HTTP requests when processing feeds. If neither are available, it will make sequential requests using <code>file_get_contents</code>.</p>
 			<?php 
 			$http_type = 'file_get_contents';
-			if (extension_loaded('http') && class_exists('HttpRequestPool')) {
-				$http_type = 'HttpRequestPool';
+			if (extension_loaded('http') && class_exists('http\Client\Request')) {
+				$http_type = 'HTTP extension';
 			} elseif ($curl_ok && function_exists('curl_multi_init')) {
 				$http_type = 'curl_multi';
 			}
 			?>
 			<p class="highlight"><strong><?php echo $http_type; ?></strong> will be used on this server.</p>
 			
-			<h4>Alternative PHP Cache (APC)</h4>
+			<h4>Alternative PHP Cache (APC/APCu)</h4>
 			<p>Full-Text RSS can make use of APC's memory cache to store site config files (when requested for the first time). This is not required, but if available it may improve performance slightly by reducing disk access.</p>
 			<?php
 			if (function_exists('apc_add')) {
@@ -372,6 +388,17 @@ div.chunk {
 			}
 			?>
 			
+			<h4>HTML parser</h4>
+			<p><?php echo $app_name; ?> uses the fast libxml parser (the default PHP parser) but it will automatically make use of Gumbo (a fast HTML5 parser) if the <a href="https://github.com/layershifter/gumbo-php">Gumbo PHP</a> extension is installed. Alternatively, HTML5-PHP (an HTML5 parser written in PHP) can be used by passing &amp;parser=html5 as a parameter. The latter might produce better results than libxml for some sites, but is a little slower.</p>
+			<?php
+			if ($gumbo_ok) {
+				echo '<p class="highlight"><strong>Gumbo PHP</strong> will be used on this server.</p>';
+			} else {
+				echo '<p class="highlight">libxml will be used by default, unless HTML5 parsing is requested.</p>';
+			}
+			?>
+
+<!--
 			<h4>Language detection</h4>
 			<p>Full-Text RSS can detect the language of each article processed. This occurs using <a href="http://pear.php.net/package/Text_LanguageDetect">Text_LanguageDetect</a> or <a href="https://github.com/lstrojny/php-cld">PHP-CLD</a> (if available).</p>
 			<?php
@@ -381,7 +408,7 @@ div.chunk {
 				echo '<p class="highlight"><strong>Text_LanguageDetect</strong> will be used on this server.</p>';
 			}
 			?>
-			
+-->
 			<h4>Automatic site config updates</h4>
 			<p>Full-Text RSS can be configured to update its site config files (which determine how content should be extracted for certain sites) by downloading the latest set from our GitHub repository. This functionaility is not required, and can be done manually. To configure this to occur automatically, you will need zip support enabled in PHP - we make use of the ZipArchive class.</p>
 			<?php

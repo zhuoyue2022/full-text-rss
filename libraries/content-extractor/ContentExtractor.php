@@ -5,26 +5,50 @@
  * Uses patterns specified in site config files and auto detection (hNews/PHP Readability) 
  * to extract content from HTML files.
  * 
- * @version 1.0
- * @date 2013-02-05
+ * @version 1.4
+ * @date 2017-09-25
  * @author Keyvan Minoukadeh
- * @copyright 2013 Keyvan Minoukadeh
+ * @copyright 2017 Keyvan Minoukadeh
  * @license http://www.gnu.org/licenses/agpl-3.0.html AGPL v3
  */
 
 class ContentExtractor
 {
+	protected static $tidy_config = array(
+				 'clean' => false, // can't preserve wbr tabs if this is set to true
+				 'output-xhtml' => true,
+				 'logical-emphasis' => true,
+				 'show-body-only' => false,
+				 'new-blocklevel-tags' => 'article aside footer header hgroup menu nav section details datagrid',
+				 'new-inline-tags' => 'mark time meter progress data wbr',
+				 'wrap' => 0,
+				 'drop-empty-paras' => true,
+				 'drop-proprietary-attributes' => false,
+				 'enclose-text' => true,
+				 'enclose-block-text' => true,
+				 'merge-divs' => true,
+				 'merge-spans' => true,
+				 'char-encoding' => 'utf8',
+				 'hide-comments' => true
+				 );
 	protected $html;
 	protected $config;
+	protected $userSubmittedConfig;
 	protected $title;
+	protected $nativeAd = false;
 	protected $author = array();
 	protected $language;
 	protected $date;
 	protected $body;
 	protected $success = false;
 	protected $nextPageUrl;
-	public $allowedParsers = array('libxml', 'html5lib');
+	protected $opengraph = array();
+	protected $twitterCard = array();
+	public $allowedParsers = array('libxml', 'html5php');
+	public $defaultParser = 'libxml';
+	public $parserOverride = null;
 	public $fingerprints = array();
+	public $stripImages = false;
 	public $readability;
 	public $debug = false;
 	public $debugVerbose = false;
@@ -37,7 +61,7 @@ class ContentExtractor
 		if ($this->debug) {
 			$mem = round(memory_get_usage()/1024, 2);
 			$memPeak = round(memory_get_peak_usage()/1024, 2);
-			echo '* ',$msg,"<br />";
+			echo '* ',$msg;
 			if ($this->debugVerbose) echo ' - mem used: ',$mem," (peak: $memPeak)";
 			echo "\n";
 			ob_flush();
@@ -46,16 +70,20 @@ class ContentExtractor
 	}
 	
 	public function reset() {
+		// we do not reset $this->userSubmittedConfig (it gets reused)
 		$this->html = null;
 		$this->readability = null;
 		$this->config = null;
 		$this->title = null;
+		$this->nativeAd = false;
 		$this->body = null;
 		$this->author = array();
 		$this->language = null;
 		$this->date = null;
 		$this->nextPageUrl = null;
 		$this->success = false;
+		$this->opengraph = array();
+		$this->twitterCard = array();
 	}
 
 	public function findHostUsingFingerprints($html) {
@@ -79,21 +107,13 @@ class ContentExtractor
 	}
 	
 	// returns SiteConfig instance (joined in order: exact match, wildcard, fingerprint, global, default)
-	public function buildSiteConfig($url, $html='', $add_to_cache=true) {
+	public function buildSiteConfig($url, $html='') {
 		// extract host name
 		$host = @parse_url($url, PHP_URL_HOST);
 		$host = strtolower($host);
 		if (substr($host, 0, 4) == 'www.') $host = substr($host, 4);
-		// is merged version already cached?
-		if (SiteConfig::is_cached("$host.merged")) {
-			$this->debug("Returning cached and merged site config for $host");
-			return SiteConfig::build("$host.merged");
-		}
 		// let's build from site_config/custom/ and standard/
 		$config = SiteConfig::build($host);
-		if ($add_to_cache && $config && !SiteConfig::is_cached("$host")) {
-			SiteConfig::add_to_cache($host, $config);
-		}
 		// if no match, use defaults
 		if (!$config) $config = new SiteConfig();
 		// load fingerprint config?
@@ -103,10 +123,6 @@ class ContentExtractor
 				if ($config_fingerprint = SiteConfig::build($_fphost)) {
 					$this->debug("Appending site config settings from $_fphost (fingerprint match)");
 					$config->append($config_fingerprint);
-					if ($add_to_cache && !SiteConfig::is_cached($_fphost)) {
-						//$config_fingerprint->cache_in_apc = true;
-						SiteConfig::add_to_cache($_fphost, $config_fingerprint);
-					}
 				}
 			}
 		}
@@ -115,18 +131,7 @@ class ContentExtractor
 			if ($config_global = SiteConfig::build('global', true)) {
 				$this->debug('Appending site config settings from global.txt');
 				$config->append($config_global);
-				if ($add_to_cache && !SiteConfig::is_cached('global')) {
-					//$config_global->cache_in_apc = true;
-					SiteConfig::add_to_cache('global', $config_global);
-				}
 			}
-		}
-		// store copy of merged config
-		if ($add_to_cache) {
-			// do not store in APC if wildcard match
-			$use_apc = ($host == $config->cache_key);
-			$config->cache_key = null;
-			SiteConfig::add_to_cache("$host.merged", $config, $use_apc);
 		}
 		return $config;
 	}
@@ -137,7 +142,17 @@ class ContentExtractor
 	// but it has problems of its own which we try to avoid with this option.
 	public function process($html, $url, $smart_tidy=true) {
 		$this->reset();
-		$this->config = $this->buildSiteConfig($url, $html);
+		// use user submitted config and merge it with regular one
+		if (isset($this->userSubmittedConfig)) {
+			$this->debug('Using user-submitted site config');
+			$this->config = $this->userSubmittedConfig;
+			if ($this->config->autodetect_on_failure()) {
+				$this->debug('Merging user-submitted site config with site config files associated with this URL and/or content');
+				$this->config->append($this->buildSiteConfig($url, $html));
+			}
+		} else {
+			$this->config = $this->buildSiteConfig($url, $html);
+		}
 		
 		// do string replacements
 		if (!empty($this->config->find_string)) {
@@ -149,30 +164,55 @@ class ContentExtractor
 			}
 			unset($_count);
 		}
-
-		// load and parse html
-		$_parser = $this->config->parser();
-		if (!in_array($_parser, $this->allowedParsers)) {
-			$this->debug("HTML parser $_parser not listed, using libxml instead");
-			$_parser = 'libxml';
-		}
-		$this->debug("Attempting to parse HTML with $_parser");
-		$this->readability = new Readability($html, $url, $_parser, $this->config->tidy() && $smart_tidy);
-		$tidied = $this->readability->tidied;
 		
-		// we use xpath to find elements in the given HTML document; see http://en.wikipedia.org/wiki/XPath_1.0
-		$xpath = new DOMXPath($this->readability->dom);
+		// load and parse html
+		if ($this->parserOverride) {
+			// from querystring: &parser=xxx
+			$_parser = $this->parserOverride;
+		} else {
+			// from site config file: parser: xxx
+			$_parser = $this->config->parser();
+		}
+		// for backword compatibility...
+		if ($_parser == 'html5lib') $_parser = 'html5php';
+		if (!in_array($_parser, $this->allowedParsers)) {
+			$this->debug("HTML parser $_parser not listed, using ".$this->defaultParser." instead");
+			$_parser = $this->defaultParser;
+		}
+		// Full-Text RSS 3.7...
+		if (class_exists('Layershifter\Gumbo\Parser')) {
+			$this->debug("Gumbo PHP extension will be used for HTML parsing");
+			$_parser = 'gumbo'; // fast HTML5 parser
+		}
 
-		// skip entries (using xpath expressions)
-		foreach ($this->config->skip_entry as $pattern) {
-			$elems = @$xpath->evaluate($pattern, $this->readability->dom);
-			// check for matches
-			if (is_string($elems) || ($elems instanceof DOMNodeList && $elems->length > 0)) {
-				$this->debug('Skipping entry on pattern.');
-				$this->debug("...XPath match: $pattern");
-				return false;
+		// use tidy (if it exists)?
+		// This fixes problems with some sites which would otherwise
+		// trouble DOMDocument's HTML parsing. (Although sometimes it
+		// makes matters worse, which is why you can override it in site config files.)
+		$tidied = false;
+		if ($this->config->tidy() && function_exists('tidy_parse_string') && $smart_tidy) {
+			// if we're using HTML5 parser and no explicit tidy declaration in site config file
+			// we'll skip tidy
+			if (($_parser == 'gumbo' || $_parser == 'html5php') && ($this->config->tidy === null)) {
+				// No Tidy
+			} else {
+				$this->debug('Using Tidy');
+				$tidy = tidy_parse_string($html, self::$tidy_config, 'UTF8');
+				if (tidy_clean_repair($tidy)) {
+					$original_html = $html;
+					$tidied = true;
+					$html = $tidy->value;
+				}
+				unset($tidy);
 			}
 		}
+		
+		$this->debug("Attempting to parse HTML with $_parser");
+		$this->readability = new Readability($html, $url, $_parser);
+		
+		// we use xpath to find elements in the given HTML document
+		// see http://en.wikipedia.org/wiki/XPath_1.0
+		$xpath = new DOMXPath($this->readability->dom);
 
 		// try to get next page link
 		foreach ($this->config->next_page_link as $pattern) {
@@ -193,9 +233,18 @@ class ContentExtractor
 			}
 		}
 		
+		// check if this is a native ad
+		foreach ($this->config->native_ad_clue as $pattern) {
+			$elems = @$xpath->evaluate($pattern, $this->readability->dom);
+			if ($elems instanceof DOMNodeList && $elems->length > 0) {
+				$this->nativeAd = true;
+				break;
+			}
+		}
+
 		// try to get title
 		foreach ($this->config->title as $pattern) {
-			// $this->debug("Trying to get title $pattern");
+			// $this->debug("Trying $pattern");
 			$elems = @$xpath->evaluate($pattern, $this->readability->dom);
 			if (is_string($elems)) {
 				$this->title = trim($elems);
@@ -242,7 +291,7 @@ class ContentExtractor
 		}
 		
 		// try to get language
-		$_lang_xpath = array('//html[@lang]/@lang', '//body[@lang]/@lang', '//meta[@name="DC.language"]/@content');
+		$_lang_xpath = array('//html[@lang]/@lang', '//meta[@name="DC.language"]/@content');
 		foreach ($_lang_xpath as $pattern) {
 			$elems = @$xpath->evaluate($pattern, $this->readability->dom);
 			if (is_string($elems)) {
@@ -260,7 +309,44 @@ class ContentExtractor
 				if ($this->language) break;
 			}
 		}
-		
+
+		// try to get open graph elements
+		$elems = @$xpath->query("//head//meta[@property='og:title' or @property='og:type' or @property='og:url' or @property='og:image' or @property='og:description']", $this->readability->dom);
+		// check for matches
+		if ($elems && $elems->length > 0) {
+			$this->debug('Extracting Open Graph elements');
+			foreach ($elems as $elem) {
+				if ($elem->hasAttribute('content')) {
+					$_prop = strtolower($elem->getAttribute('property'));
+					$_val = $elem->getAttribute('content');
+					// currently one of each is returned, so we keep the first one
+					if (!isset($this->opengraph[$_prop])) {
+						$this->opengraph[$_prop] = $_val;
+					}
+				}
+			}
+			unset($_prop, $_val);
+		}
+
+		// try to get Twitter Card elements
+		// TODO: add more, but multiple colons, e.g. twitter:site:id cause problems for RSS validation (namespace). For the others, maybe only return in JSON output
+		$elems = @$xpath->query("//head//meta[@name='twitter:card' or @name='twitter:site' or @name='twitter:creator' or @name='twitter:description' or @name='twitter:title' or @name='twitter:image']", $this->readability->dom);
+		// check for matches
+		if ($elems && $elems->length > 0) {
+			$this->debug('Extracting Twiter Card elements');
+			foreach ($elems as $elem) {
+				if ($elem->hasAttribute('content')) {
+					$_prop = strtolower($elem->getAttribute('name'));
+					$_val = $elem->getAttribute('content');
+					// currently one of each is returned, so we keep the first one
+					if (!isset($this->twitterCard[$_prop])) {
+						$this->twitterCard[$_prop] = $_val;
+					}
+				}
+			}
+			unset($_prop, $_val);
+		}		
+
 		// try to get date
 		foreach ($this->config->date as $pattern) {
 			$elems = @$xpath->evaluate($pattern, $this->readability->dom);
@@ -286,9 +372,15 @@ class ContentExtractor
 			$elems = @$xpath->query($pattern, $this->readability->dom);
 			// check for matches
 			if ($elems && $elems->length > 0) {
-				$this->debug('Stripping '.$elems->length.' elements (strip)');
+				$this->debug('Stripping '.$elems->length.' elements (strip: '.$pattern.')');
 				for ($i=$elems->length-1; $i >= 0; $i--) {
-					$elems->item($i)->parentNode->removeChild($elems->item($i));
+					if ($elems->item($i)->parentNode) {
+						if ($elems->item($i) instanceof DOMAttr) {
+							$elems->item($i)->parentNode->removeAttributeNode($elems->item($i));
+						} else {
+							$elems->item($i)->parentNode->removeChild($elems->item($i));
+						}
+					}
 				}
 			}
 		}
@@ -299,7 +391,7 @@ class ContentExtractor
 			$elems = @$xpath->query("//*[contains(@class, '$string') or contains(@id, '$string')]", $this->readability->dom);
 			// check for matches
 			if ($elems && $elems->length > 0) {
-				$this->debug('Stripping '.$elems->length.' elements (strip_id_or_class)');
+				$this->debug('Stripping '.$elems->length.' elements (strip_id_or_class: '.$string.')');
 				for ($i=$elems->length-1; $i >= 0; $i--) {
 					$elems->item($i)->parentNode->removeChild($elems->item($i));
 				}
@@ -312,12 +404,13 @@ class ContentExtractor
 			$elems = @$xpath->query("//img[contains(@src, '$string')]", $this->readability->dom);
 			// check for matches
 			if ($elems && $elems->length > 0) {
-				$this->debug('Stripping '.$elems->length.' image elements');
+				$this->debug('Stripping '.$elems->length.' elements (strip_image_src: '.$string.')');
 				for ($i=$elems->length-1; $i >= 0; $i--) {
 					$elems->item($i)->parentNode->removeChild($elems->item($i));
 				}
 			}
 		}
+
 		// strip elements using Readability.com and Instapaper.com ignore class names
 		// .entry-unrelated and .instapaper_ignore
 		// See https://www.readability.com/publishers/guidelines/#view-plainGuidelines
@@ -331,20 +424,44 @@ class ContentExtractor
 			}
 		}
 		
-		// strip elements that contain style 'display: none' or 'visibility:hidden'
-		$elems = @$xpath->query("//*[contains(@style,'display:none') or contains(@style,'visibility:hidden')]", $this->readability->dom);
+		// strip elements that contain style="display: none;"
+		$elems = @$xpath->query("//*[contains(@style,'display:none')]", $this->readability->dom);
 		// check for matches
 		if ($elems && $elems->length > 0) {
-			$this->debug('Stripping '.$elems->length.' elements with inline display:none or visibility:hidden style');
+			$this->debug('Stripping '.$elems->length.' elements with inline display:none style');
 			for ($i=$elems->length-1; $i >= 0; $i--) {
 				$elems->item($i)->parentNode->removeChild($elems->item($i));
 			}
 		}
-		
+
+		// strip empty a elements
+		$elems = $xpath->query("//a[not(./*) and normalize-space(.)='']", $this->readability->dom);
+		// check for matches
+		if ($elems && $elems->length > 0) {
+			$this->debug('Stripping '.$elems->length.' empty a elements');
+			for ($i=$elems->length-1; $i >= 0; $i--) {
+				$elems->item($i)->parentNode->removeChild($elems->item($i));
+			}
+		}
+
+		// strip img srcset/sizes attributes with relative URIs (src should be present and will be absolutised)
+		// TODO: absolutize srcet values rather than removing them
+		// To remove srcset from all image elements, site config files can contain: strip: //img/@srcset
+		$elems = $xpath->query("//img[@srcset and not(contains(@srcset, '//'))]", $this->readability->dom);
+		// check for matches
+		if ($elems && $elems->length > 0) {
+			$this->debug('Stripping '.$elems->length.' srcset attributes');
+			foreach ($elems as $elem) {
+				$elem->removeAttribute('srcset');
+				if ($elem->hasAttribute('sizes')) {
+					$elem->removeAttribute('sizes');
+				}
+			}
+		}
+
 		// try to get body
 		foreach ($this->config->body as $pattern) {
 			$elems = @$xpath->query($pattern, $this->readability->dom);
-			$this->debug("Matched $elems->length content element(s)");
 			// check for matches
 			if ($elems && $elems->length > 0) {
 				$this->debug('Body matched');
@@ -360,7 +477,6 @@ class ContentExtractor
 				} else {
 					$this->body = $this->readability->dom->createElement('div');
 					$this->debug($elems->length.' body elems found');
-					$len = 0;
 					foreach ($elems as $elem) {
 						if (!isset($elem->parentNode)) continue;
 						$isDescendant = false;
@@ -375,17 +491,13 @@ class ContentExtractor
 						} else {
 							// prune (clean up elements that may not be content)
 							if ($this->config->prune()) {
-								$this->debug('...pruning content');
+								$this->debug('Pruning content');
 								$this->readability->prepArticle($elem);
 							}
-							if ($elem) {
-								$len++;
-								$this->body->appendChild($elem);
-							}
+							$this->debug('...element added to body');
+							$this->body->appendChild($elem);
 						}
 					}
-					$this->debug('...'.$len.' elements added to body');
-					unset($len);
 					if ($this->body->hasChildNodes()) break;
 				}
 			}
@@ -440,7 +552,7 @@ class ContentExtractor
 				
 				if ($detect_date) {
 					// check for time element with pubdate attribute
-					$elems = @$xpath->query(".//time[@pubdate] | .//abbr[contains(concat(' ',normalize-space(@class),' '),' published ')]", $hentry);
+					$elems = @$xpath->query(".//time[@pubdate or @pubDate] | .//abbr[contains(concat(' ',normalize-space(@class),' '),' published ')]", $hentry);
 					if ($elems && $elems->length > 0) {
 						$this->date = strtotime(trim($elems->item(0)->textContent));
 						// remove date from document
@@ -487,7 +599,7 @@ class ContentExtractor
 						if ($elems->length == 1) {
 							// what if it's empty? (some sites misuse hNews - place their content outside an empty entry-content element)
 							$e = $elems->item(0);
-							if (strcasecmp($e->tagName, 'img') == 0 || (trim($e->textContent) != '')) {
+							if (($e->tagName == 'img') || (trim($e->textContent) != '')) {
 								$this->body = $elems->item(0);
 								// prune (clean up elements that may not be content)
 								if ($this->config->prune()) {
@@ -556,6 +668,55 @@ class ContentExtractor
 				$detect_body = false;
 			}
 		}
+
+		// check for elements marked with itemprop="articleBody" (from Schema.org)
+		if ($detect_body) {
+			$elems = @$xpath->query("//*[@itemprop='articleBody']", $this->readability->dom);
+			if ($elems && $elems->length > 0) {
+				$this->debug('body found (Schema.org itemprop="articleBody")');
+				if ($elems->length == 1) {
+					// what if it's empty? (content placed outside an empty itemprop='articleBody' element)
+					$e = $elems->item(0);
+					if (($e->tagName == 'img') || (trim($e->textContent) != '')) {
+						$this->body = $elems->item(0);
+						// prune (clean up elements that may not be content)
+						if ($this->config->prune()) {
+							$this->debug('Pruning content');
+							$this->readability->prepArticle($this->body);
+						}
+						$detect_body = false;
+					} else {
+						$this->debug('Schema.org: skipping itemprop="articleBody" - appears not to contain content');
+					}
+					unset($e);
+				} else {
+					$this->body = $this->readability->dom->createElement('div');
+					$this->debug($elems->length.' itemprop="articleBody" elems found');
+					foreach ($elems as $elem) {
+						if (!isset($elem->parentNode)) continue;
+						$isDescendant = false;
+						foreach ($this->body->childNodes as $parent) {
+							if ($this->isDescendant($parent, $elem)) {
+								$isDescendant = true;
+								break;
+							}
+						}
+						if ($isDescendant) {
+							$this->debug('Element is child of another body element, skipping.');
+						} else {
+							// prune (clean up elements that may not be content)
+							if ($this->config->prune()) {
+								$this->debug('Pruning content');
+								$this->readability->prepArticle($elem);
+							}								
+							$this->debug('Element added to body');									
+							$this->body->appendChild($elem);
+						}
+					}
+					$detect_body = false;
+				}
+			}
+		}
 		
 		// Find author in rel="author" marked element
 		// We only use this if there's exactly one.
@@ -574,11 +735,26 @@ class ContentExtractor
 			}
 		}
 
+		// Find date in Open Graph meta element
+		// http://ogp.me/#no_vertical
+		if ($detect_date) {
+			$elems = @$xpath->query("//meta[@property='article:published_time' and @content]", $this->readability->dom);
+			if ($elems && $elems->length == 1) {
+				$this->date = strtotime(trim($elems->item(0)->getAttribute('content')));
+				if ($this->date) {
+					$this->debug('Date found (article:published_time): '.date('Y-m-d H:i:s', $this->date));
+					$detect_date = false;
+				} else {
+					$this->date = null;
+				}
+			}
+		}
+
 		// Find date in pubdate marked time element
 		// For the same reason given above, we only use this
 		// if there's exactly one element.
 		if ($detect_date) {
-			$elems = @$xpath->query("//time[@pubdate]", $this->readability->dom);
+			$elems = @$xpath->query("//time[@pubdate or @pubDate]", $this->readability->dom);
 			if ($elems && $elems->length == 1) {
 				$this->date = strtotime(trim($elems->item(0)->textContent));
 				// remove date from document
@@ -599,10 +775,9 @@ class ContentExtractor
 			if (isset($this->body)) $this->body = $this->body->cloneNode(true);
 			$success = $this->readability->init();
 		}
-
 		if ($detect_title) {
+			$this->debug('Detecting title');
 			$this->title = $this->readability->getTitle()->textContent;
-			$this->debug("Detected title \"$this->title\"");
 		}
 		if ($detect_body && $success) {
 			$this->debug('Detecting body');
@@ -633,18 +808,37 @@ class ContentExtractor
 				}
 			}
 			// prevent self-closing iframes
-			$elems = $this->body->getElementsByTagName('iframe');
-			for ($i = $elems->length-1; $i >= 0; $i--) {
-				$e = $elems->item($i);
-				if (!$e->hasChildNodes()) {
-					$e->appendChild($this->body->ownerDocument->createTextNode('[embedded content]'));
+			// better to do this or to look for all elements not matching known void elements?
+			// Will requesting HTML5 output using HTML5-PHP fix this issue?
+			$_dont_self_close = array('iframe', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6');
+			foreach ($_dont_self_close as $_tagname) {
+				if ($this->body->tagName === $_tagname) {
+					if (!$this->body->hasChildNodes()) {
+						if ($_tagname === 'iframe') {
+							$this->body->appendChild($this->body->ownerDocument->createTextNode('[embedded content]'));
+						} else {
+							$this->body->appendChild($this->body->ownerDocument->createTextNode(''));
+						}
+					}
+				} else {
+					$elems = $this->body->getElementsByTagName($_tagname);
+					for ($i = $elems->length-1; $i >= 0; $i--) {
+						$e = $elems->item($i);
+						if (!$e->hasChildNodes()) {
+							if ($_tagname === 'iframe') {
+								$e->appendChild($this->body->ownerDocument->createTextNode('[embedded content]'));
+							} else {
+								$e->appendChild($this->body->ownerDocument->createTextNode(''));
+							}
+						}
+					}
 				}
 			}
 			// remove image lazy loading - WordPress plugin http://wordpress.org/extend/plugins/lazy-load/
 			// the plugin replaces the src attribute to point to a 1x1 gif and puts the original src
 			// inside the data-lazy-src attribute. It also places the original image inside a noscript element 
 			// next to the amended one.
-			$elems = @$xpath->query("//img[@data-lazy-src]|//img[@data-src]", $this->body);
+			$elems = @$xpath->query(".//img[@data-lazy-src]", $this->body);
 			for ($i = $elems->length-1; $i >= 0; $i--) {
 				$e = $elems->item($i);
 				// let's see if we can grab image from noscript
@@ -654,36 +848,55 @@ class ContentExtractor
 					$e->nextSibling->parentNode->replaceChild($_new_elem, $e->nextSibling);
 					$e->parentNode->removeChild($e);
 				} else {
-					// Use data[-lazy]-src as src value
-					$src = $e->getAttribute('data-lazy-src');
+					// Use data-lazy-src as src value
+					$e->setAttribute('src', $e->getAttribute('data-lazy-src'));
 					$e->removeAttribute('data-lazy-src');
-					if (!$src) {
-						$src = $e->getAttribute('data-src');
-						$e->removeAttribute('data-src');						
+				}
+			}
+			// now let's deal with another lazy load technique. Example:
+			// <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" class="lazyload" 
+			// data-src="http://i68.tinypic.com/2jabu8.jpg" alt="Image and video hosting by TinyPic" border="0" />
+			$elems = @$xpath->query(".//img[@data-src and (contains(@src, 'data:image') or contains(@src, '.gif'))]", $this->body);
+			for ($i = $elems->length-1; $i >= 0; $i--) {
+				$e = $elems->item($i);
+				$e->setAttribute('src', $e->getAttribute('data-src'));
+				$e->removeAttribute('data-src');
+			}
+			// Strip images?
+			if ($this->stripImages && $this->body->hasChildNodes()) {
+				$elems = @$xpath->query("//figure | //img | //figcaption", $this->body);
+				// check for matches
+				if ($elems && $elems->length > 0) {
+					$this->debug('Stripping images: '.$elems->length.' img/figure/figcaption elements');
+					for ($i=$elems->length-1; $i >= 0; $i--) {
+						@$elems->item($i)->parentNode->removeChild($elems->item($i));
 					}
-					$e->setAttribute('src', $src);
+				}
+			} else {
+				// If there's an og:image, but we have no images in the article, let's place it at the beginning of the article.
+				if ($this->config->insert_detected_image() && $this->body->hasChildNodes() && isset($this->opengraph['og:image']) && substr($this->opengraph['og:image'], 0, 4) === 'http') {
+					$elems = @$xpath->query(".//img", $this->body);
+					if ($elems->length === 0) {
+						$_new_elem = $this->body->ownerDocument->createDocumentFragment();
+						@$_new_elem->appendXML('<div><img src="'.htmlspecialchars($this->opengraph['og:image']).'" class="ff-og-image-inserted" /></div>');
+						$this->body->insertBefore($_new_elem, $this->body->firstChild);
+					}
 				}
 			}
 		
 			$this->success = true;
 		}
-
+		
 		// if we've had no success and we've used tidy, there's a chance
 		// that tidy has messed up. So let's try again without tidy...
 		if (!$this->success && $tidied && $smart_tidy) {
 			$this->debug('Trying again without tidy');
-			unset($this->readability, $this->body, $xpath);
-			return $this->process($original_html, $url, false);
-		}
-
-		if ($this->success && $this->config->images_to_datauri()) {
-			$this->debug('Converting images to data-URI');
-			$this->readability->imageCache->cacheFromDocument($this->body);
+			$this->process($original_html, $url, false);
 		}
 
 		return $this->success;
 	}
-	
+
 	private function isDescendant(DOMElement $parent, DOMElement $child) {
 		$node = $child->parentNode;
 		while ($node != null) {
@@ -693,8 +906,24 @@ class ContentExtractor
 		return false;
 	}
 
+	public function setUserSubmittedConfig($config_string) {
+		$this->userSubmittedConfig = SiteConfig::build_from_string($config_string);
+	}
+
 	public function getContent() {
 		return $this->body;
+	}
+
+	public function getOpenGraph() {
+		return $this->opengraph;
+	}
+
+	public function getTwitterCard() {
+		return $this->twitterCard;
+	}
+
+	public function isNativeAd() {
+		return $this->nativeAd;
 	}
 	
 	public function getTitle() {

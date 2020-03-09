@@ -7,11 +7,11 @@
  * For environments which do not have these options, it reverts to standard sequential 
  * requests (using file_get_contents())
  * 
- * @version 1.4
- * @date 2013-05-10
- * @see http://php.net/HttpRequestPool
+ * @version 1.8
+ * @date 2017-09-25
+ * @see http://devel-m6w6.rhcloud.com/mdref/http
  * @author Keyvan Minoukadeh
- * @copyright 2011-2013 Keyvan Minoukadeh
+ * @copyright 2011-2016 Keyvan Minoukadeh
  * @license http://www.gnu.org/licenses/agpl-3.0.html AGPL v3
  */
 
@@ -21,22 +21,25 @@ class HumbleHttpAgent
 	const METHOD_CURL_MULTI = 2;
 	const METHOD_FILE_GET_CONTENTS = 4;
 	//const UA_BROWSER = 'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:2.0.1) Gecko/20100101 Firefox/4.0.1';
-	const UA_BROWSER = 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/535.2 (KHTML, like Gecko) Chrome/15.0.874.92 Safari/535.2';
-	const UA_PHP = 'PHP/5.4';
+	// popular user agents from https://techblog.willshouse.com/2012/01/03/most-common-user-agents/
+	const UA_BROWSER = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36';
+	const UA_PHP = 'PHP/7.1';
 	const REF_GOOGLE = 'http://www.google.co.uk/url?sa=t&source=web&cd=1';
 	
 	protected $requests = array();
 	protected $redirectQueue = array();
 	protected $requestOptions;
 	protected $maxParallelRequests = 5;
-	protected $cache = null;
+	protected $cache = null; //TODO
 	protected $httpContext;
+	protected $curlOptions;
 	protected $minimiseMemoryUse = false; //TODO
-	protected $cookieJar;
-	public $method;
+	protected $method;
+	protected $cookieJar = array();
 	public $debug = false;
 	public $debugVerbose = false;
 	public $rewriteHashbangFragment = true; // see http://code.google.com/web/ajaxcrawling/docs/specification.html
+	public $siteConfigBuilder = null; // can be set to an instance of ContentExtractor to have site config files used for custom HTTP headers
 	public $maxRedirects = 5;
 	public $userAgentMap = array();
 	public $rewriteUrls = array();
@@ -66,7 +69,7 @@ class HumbleHttpAgent
 		if (in_array($method, array(1,2,4))) {
 			$this->method = $method;
 		} else {
-			if (class_exists('HttpRequestPool')) {
+			if (class_exists('http\Client\Request')) {
 				$this->method = self::METHOD_REQUEST_POOL;
 			} elseif (function_exists('curl_multi_init')) {
 				$this->method = self::METHOD_CURL_MULTI;
@@ -78,8 +81,9 @@ class HumbleHttpAgent
 			require_once(dirname(__FILE__).'/RollingCurl.php');
 		}
 		// create cookie jar
-		$this->cookieJar = new CookieJar();
+		// $this->cookieJar = new CookieJar();
 		// set request options (redirect must be 0)
+		// HTTP PECL (http://php.net/manual/en/http.request.options.php)
 		$this->requestOptions = array(
 			'timeout' => 15,
 			'connecttimeout' => 15,
@@ -90,6 +94,7 @@ class HumbleHttpAgent
 		if (is_array($requestOptions)) {
 			$this->requestOptions = array_merge($this->requestOptions, $requestOptions);
 		}
+		// HTTP file_get_contents
 		$this->httpContext = array(
 			'http' => array(
 				'ignore_errors' => true,
@@ -98,51 +103,36 @@ class HumbleHttpAgent
 				'header' => "Accept: */*\r\n"
 				)
 			);
-	}
-
-	public function initCache($dir, $level = 0, $cleanup = 100, $life = 3600) {
-		$this->debug('HTTP cache TTL is set to '.$life.' sec.');
-		$frontendOptions = array(
-			'lifetime' => $life, // cache lifetime
-			'automatic_serialization' => false,
-			'write_control' => false,
-			'automatic_cleaning_factor' => $cleanup,
-			'ignore_user_abort' => false
-		);
-		$backendOptions = array(
-			'cache_dir' => $dir.'/urls/', // directory where to put the cache files
-			'file_locking' => false,
-			'read_control' => true,
-			'read_control_type' => 'strlen',
-			'hashed_directory_level' => $level,
-			'hashed_directory_perm' => 0777,
-			'cache_file_perm' => 0664,
-			'file_name_prefix' => 'ff'
-		);
-		// getting a Zend_Cache_Core object
-		$this->cache = Zend_Cache::factory('Core', 'File', $frontendOptions, $backendOptions);
-	}
-
-	private function isCached($url) {
-		if (!$this->cache || !$url) return false;
-		return ($this->cache->test('request'.md5($url)) !== false);
-	}
-
-	private function setCached($url, $data) {
-		if (!$this->cache || !$url || !$data) return;
-		$this->cache->save(serialize($data), 'request'.md5($url));
+		// HTTP cURL
+		if ($this->method === self::METHOD_CURL_MULTI) {
+			$this->curlOptions = array(
+				CURLOPT_CONNECTTIMEOUT => $this->requestOptions['timeout'],
+				CURLOPT_TIMEOUT => $this->requestOptions['timeout']
+			);
+		}
+		// Use proxy?
+		if (isset($this->requestOptions['proxyhost']) && $this->requestOptions['proxyhost']) {
+			// For file_get_contents (see http://stackoverflow.com/a/1336419/407938)			
+			$this->httpContext['http']['proxy'] = 'tcp://'.$this->requestOptions['proxyhost'];
+			$this->httpContext['http']['request_fulluri'] = true;
+			// For cURL (see http://stackoverflow.com/a/9247672/407938)
+			if ($this->method === self::METHOD_CURL_MULTI) {
+				$this->curlOptions[CURLOPT_PROXY] = $this->requestOptions['proxyhost'];
+			}
+			if (isset($this->requestOptions['proxyauth'])) {
+				$this->httpContext['http']['header'] .= "Proxy-Authorization: Basic ".base64_encode($this->requestOptions['proxyauth'])."\r\n";
+				if ($this->method === self::METHOD_CURL_MULTI) {
+					$this->curlOptions[CURLOPT_PROXYUSERPWD] = $this->requestOptions['proxyauth'];
+				}
+			}
+		}
 	}
 	
-	private function getCached($url) {
-		if (!$this->cache || !$url) return null;
-		return unserialize($this->cache->load('request'.md5($url)));
-	}
-
 	protected function debug($msg) {
 		if ($this->debug) {
 			$mem = round(memory_get_usage()/1024, 2);
 			$memPeak = round(memory_get_peak_usage()/1024, 2);
-			echo '* ',$msg,"<br />";
+			echo '* ',$msg;
 			if ($this->debugVerbose) echo ' - mem used: ',$mem," (peak: $memPeak)";
 			echo "\n";
 			ob_flush();
@@ -205,11 +195,30 @@ class HumbleHttpAgent
 	
 	public function getMetaRefreshURL($url, $html) {
 		if ($html == '') return false;
+
+		// TODO: parse HTML properly
+		// For now, to deal with cases where meta refresh matches but shouldn't, e.g. CNN's 
+		// <!--[if lte IE 9]><meta http-equiv="refresh" content="1;url=/2.37.2/static/unsupp.html" /><![endif]-->
+		// we do the string replacements in the site config file before looking for the meta refresh
+		if (isset($this->siteConfigBuilder)) {
+			$sconfig = $this->siteConfigBuilder->buildSiteConfig($url);
+			// do string replacements
+			if (!empty($sconfig->find_string)) {
+				if (count($sconfig->find_string) == count($sconfig->replace_string)) {
+					$html = str_replace($sconfig->find_string, $sconfig->replace_string, $html, $_count);
+					//$this->debug("Strings replaced: $_count (find_string and/or replace_string)");
+				} else {
+					//$this->debug('Skipped string replacement - incorrect number of find-replace strings in site config');
+				}
+			}
+		}
+
 		// <meta HTTP-EQUIV="REFRESH" content="0; url=http://www.bernama.com/bernama/v6/newsindex.php?id=943513">
-		if (!preg_match('!<meta http-equiv=["\']?refresh["\']? content=["\']?[0-9];\s*url=["\']?([^"\'>]+)["\']*>!i', $html, $match)) {
+		if (!preg_match('!<meta http-equiv=["\']?refresh["\']? content=["\']?[0-9];\s*url=["\']?([^"\'>]+)["\']?!i', $html, $match)) {
 			return false;
 		}
 		$redirect_url = $match[1];
+		$redirect_url = htmlspecialchars_decode($redirect_url); // For Facebook!
 		if (preg_match('!^https?://!i', $redirect_url)) {
 			// already absolute
 			$this->debug('Meta refresh redirect found (http-equiv="refresh"), new URL: '.$redirect_url);
@@ -221,7 +230,7 @@ class HumbleHttpAgent
 		if (isset($base->path)) $base->path = preg_replace('!//+!', '/', $base->path);
 		if ($absolute = SimplePie_IRI::absolutize($base, $redirect_url)) {
 			$this->debug('Meta refresh redirect found (http-equiv="refresh"), new URL: '.$absolute);
-			return $absolute;
+			return $absolute->get_uri();
 		}
 		return false;
 	}	
@@ -258,6 +267,25 @@ class HumbleHttpAgent
 		}
 	}
 	
+	public function convertIdn($url) {
+		if (function_exists('idn_to_ascii')) {
+			if ($host = @parse_url($url, PHP_URL_HOST)) {
+				if (defined('INTL_IDNA_VARIANT_UTS46')) {
+					$puny = idn_to_ascii($host, 0, INTL_IDNA_VARIANT_UTS46);
+				} else {
+					$puny = idn_to_ascii($host);
+				}
+				if ($host != $puny) {
+					$pos = strpos($url, $host);
+					if ($pos !== false) {
+						$url = substr_replace($url, $puny, $pos, strlen($host));
+					}
+				}
+			}
+		}
+		return $url;
+	}
+
 	public function rewriteUrls($url) {
 		foreach ($this->rewriteUrls as $find => $action) {
 			if (strpos($url, $find) !== false) {
@@ -280,13 +308,13 @@ class HumbleHttpAgent
 	public function setMaxParallelRequests($max) {
 		$this->maxParallelRequests = $max;
 	}
-
+	
 	public function validateUrl($url) {
 		$url = filter_var($url, FILTER_SANITIZE_URL);
-		$test = filter_var($url, FILTER_VALIDATE_URL, FILTER_FLAG_SCHEME_REQUIRED);
+		$test = filter_var($url, FILTER_VALIDATE_URL);
 		// deal with bug http://bugs.php.net/51192 (present in PHP 5.2.13 and PHP 5.3.2)
 		if ($test === false) {
-			$test = filter_var(strtr($url, '-', '_'), FILTER_VALIDATE_URL, FILTER_FLAG_SCHEME_REQUIRED);
+			$test = filter_var(strtr($url, '-', '_'), FILTER_VALIDATE_URL);
 		}
 		if ($test !== false && $test !== null && preg_match('!^https?://!', $url)) {
 			return $url;
@@ -302,6 +330,7 @@ class HumbleHttpAgent
 			$this->debug("Following redirects #$redirects...");
 			$this->fetchAllOnce($this->redirectQueue, $isRedirect=true);
 		}
+		$this->deleteCookies();
 	}
 	
 	// fetch all URLs without following redirects
@@ -310,49 +339,92 @@ class HumbleHttpAgent
 		if (empty($urls)) return;
 		
 		//////////////////////////////////////////////////////
-		// parallel (HttpRequestPool)
+		// parallel (HTTP extension)
 		if ($this->method == self::METHOD_REQUEST_POOL) {
-			$this->debug('Starting parallel fetch (HttpRequestPool)');
+			$this->debug('Starting parallel fetch (HTTP Extension)');
 			try {
 				while (count($urls) > 0) {
 					$this->debug('Processing set of '.min($this->maxParallelRequests, count($urls)));
 					$subset = array_splice($urls, 0, $this->maxParallelRequests);
-					$pool = new HttpRequestPool();
+					//$pool = new HttpRequestPool();
+					$pool = new http\Client;
+					$pool->setOptions($this->requestOptions);
 					foreach ($subset as $orig => $url) {
 						if (!$isRedirect) $orig = $url;
 						unset($this->redirectQueue[$orig]);
 						$this->debug("...$url");
 						if (!$isRedirect && isset($this->requests[$url])) {
 							$this->debug("......in memory");
+						/*
 						} elseif ($this->isCached($url)) {
 							$this->debug("......is cached");
 							if (!$this->minimiseMemoryUse) {
 								$this->requests[$url] = $this->getCached($url);
 							}
+						*/
 						} else {
 							$this->debug("......adding to pool");
 							$req_url = $this->rewriteUrls($url);
+							$req_url = $this->convertIdn($req_url);
 							$req_url = ($this->rewriteHashbangFragment) ? $this->rewriteHashbangFragment($req_url) : $req_url;
 							$req_url = $this->removeFragment($req_url);
 							if (!empty($this->headerOnlyTypes) && !isset($this->requests[$orig]['wrongGuess']) && $this->possibleUnsupportedType($req_url)) {
-								$_meth = HttpRequest::METH_HEAD;
+								$_meth = "HEAD";
 							} else {
-								$_meth = HttpRequest::METH_GET;
+								$_meth = "GET";
 								unset($this->requests[$orig]['wrongGuess']);
 							}
-							$httpRequest = new HttpRequest($req_url, $_meth, $this->requestOptions);
-							// send cookies, if we have any
-							if ($cookies = $this->cookieJar->getMatchingCookies($req_url)) {
-								$this->debug("......sending cookies: $cookies");
-								$httpRequest->addHeaders(array('Cookie' => $cookies));
+							//$httpRequest = new HttpRequest($req_url, $_meth, $this->requestOptions);
+							$httpRequest = new http\Client\Request($_meth, $req_url);
+							$httpRequest->setOptions($this->requestOptions);
+
+							// check site config for additional http headers
+							$scHeaders = array();
+							if (isset($this->siteConfigBuilder)) {
+								$scHeaders = $this->siteConfigBuilder->buildSiteConfig($req_url)->http_header;
 							}
-							//$httpRequest->addHeaders(array('User-Agent' => $this->userAgent));
-							$httpRequest->addHeaders($this->getUserAgent($req_url, true));
+
+							// send cookies, if we have any
+							$_cookies = null;
+							if (isset($scHeaders['cookie'])) {
+								$_cookies = $scHeaders['cookie'];
+							} else { 
+								//$_cookies = $this->cookieJar->getMatchingCookies($req_url);
+								$_cookies = $this->getCookies($orig, $req_url);
+							}
+							if ($_cookies) {
+								$this->debug("......sending cookies: $_cookies");
+								$httpRequest->addHeaders(array('Cookie' => $_cookies));
+							}
+
+							// send user agent
+							$_ua = null;
+							if (isset($scHeaders['user-agent'])) {
+								$_ua = $scHeaders['user-agent'];
+							} else {
+								$_ua = $this->getUserAgent($req_url, true);
+								$_ua = $_ua['User-Agent'];
+							}
+							if ($_ua) {
+								$this->debug("......user-agent set to: $_ua");
+								$httpRequest->addHeaders(array('User-Agent' => $_ua));
+							}
+
 							// add referer for picky sites
-							$httpRequest->addheaders(array('Referer' => $this->referer));
+							$_referer = null;
+							if (isset($scHeaders['referer'])) {
+								$_referer = $scHeaders['referer'];
+							} else {
+								$_referer = $this->referer;
+							}
+							if ($_referer) {
+								$this->debug("......referer set to: $_referer");
+								$httpRequest->addheaders(array('Referer'=>$_referer));
+							}
+
 							$this->requests[$orig] = array('headers'=>null, 'body'=>null, 'httpRequest'=>$httpRequest);
 							$this->requests[$orig]['original_url'] = $orig;
-							$pool->attach($httpRequest);
+							$pool->enqueue($httpRequest);
 						}
 					}
 					// did we get anything into the pool?
@@ -360,16 +432,20 @@ class HumbleHttpAgent
 						$this->debug('Sending request...');
 						try {
 							$pool->send();
-						} catch (HttpRequestPoolException $e) {
+						} catch (http\Exception $e) {
 							// do nothing
 						}
 						$this->debug('Received responses');
 						foreach($subset as $orig => $url) {
 							if (!$isRedirect) $orig = $url;
 							$request = $this->requests[$orig]['httpRequest'];
+							$response = $pool->getResponse($request);
 							//$this->requests[$orig]['headers'] = $this->headersToString($request->getResponseHeader());
 							// getResponseHeader() doesn't return status line, so, for consistency...
-							$this->requests[$orig]['headers'] = substr($request->getRawResponseMessage(), 0, $request->getResponseInfo('header_size'));
+							//$headers = $response->toString();
+							$this->requests[$orig]['headers'] = $response->getInfo()."\n".$this->headersToString($response->getHeaders(), true);
+							// v1 HTTP extension code
+							//$this->requests[$orig]['headers'] = substr($request->getRawResponseMessage(), 0, $request->getResponseInfo('header_size'));
 							// check content type
 							// TODO: use getResponseHeader('content-type') or getResponseInfo()
 							if ($this->headerOnlyType($this->requests[$orig]['headers'])) {
@@ -377,28 +453,37 @@ class HumbleHttpAgent
 								$_header_only_type = true;
 								$this->debug('Header only type returned');
 							} else {
-								$this->requests[$orig]['body'] = $request->getResponseBody();
+								$this->requests[$orig]['body'] = $response->getBody()->toString();
+								//var_dump($this->requests[$orig]['body']);exit;
+								// v1 HTTP ext. code
+								//$this->requests[$orig]['body'] = $request->getResponseBody();
 								$_header_only_type = false;
 							}
-							$this->requests[$orig]['effective_url'] = $request->getResponseInfo('effective_url');
-							$this->requests[$orig]['status_code'] = $status_code = $request->getResponseCode();
+							$this->requests[$orig]['effective_url'] = $response->getTransferInfo('effective_url');
+							$this->requests[$orig]['status_code'] = $status_code = $response->getResponseCode();
+							// v1 HTTP ext. code
+							//$this->requests[$orig]['effective_url'] = $request->getResponseInfo('effective_url');
+							//$this->requests[$orig]['status_code'] = $status_code = $request->getResponseCode();
 							// is redirect?
-							if ((in_array($status_code, array(300, 301, 302, 303, 307)) || $status_code > 307 && $status_code < 400) && $request->getResponseHeader('location')) {
-								$redirectURL = $request->getResponseHeader('location');
+							if ((in_array($status_code, array(300, 301, 302, 303, 307)) || $status_code > 307 && $status_code < 400) && $response->getHeader('location')) {
+							// v1 HTTP ext. code
+							//if ((in_array($status_code, array(300, 301, 302, 303, 307)) || $status_code > 307 && $status_code < 400) && $request->getResponseHeader('location')) {
+								$redirectURL = $response->getHeader('location');
 								if (!preg_match('!^https?://!i', $redirectURL)) {
 									$redirectURL = SimplePie_Misc::absolutize_url($redirectURL, $url);
 								}
 								if ($this->validateURL($redirectURL)) {
 									$this->debug('Redirect detected. Valid URL: '.$redirectURL);
 									// store any cookies
-									$cookies = $request->getResponseHeader('set-cookie');
-									if ($cookies && !is_array($cookies)) $cookies = array($cookies);
-									if ($cookies) $this->cookieJar->storeCookies($url, $cookies);
+									//$cookies = $request->getResponseHeader('set-cookie');
+									//if ($cookies && !is_array($cookies)) $cookies = array($cookies);
+									//if ($cookies) $this->cookieJar->storeCookies($url, $cookies);
+									$this->storeCookies($orig, $url);
 									$this->redirectQueue[$orig] = $redirectURL;
 								} else {
 									$this->debug('Redirect detected. Invalid URL: '.$redirectURL);
 								}
-							} elseif (!$_header_only_type && $request->getMethod() === HttpRequest::METH_HEAD) {
+							} elseif (!$_header_only_type && $request->getRequestMethod() == "HEAD") {
 								// the response content-type did not match our 'header only' types, 
 								// but we'd issues a HEAD request because we assumed it would. So
 								// let's queue a proper GET request for this item...
@@ -410,19 +495,14 @@ class HumbleHttpAgent
 								// for AJAX sites, e.g. Blogger with its dynamic views templates.
 								// Based on Google's spec: https://developers.google.com/webmasters/ajax-crawling/docs/specification
 								if (isset($this->requests[$orig]['body'])) {
-									$redirectURL = $this->getRedirectURLfromHTML($this->requests[$orig]['effective_url'], substr($this->requests[$orig]['body'], 0, 4000));
+									$redirectURL = $this->getRedirectURLfromHTML($this->requests[$orig]['effective_url'], substr($this->requests[$orig]['body'], 0, 150000));
 									if ($redirectURL) {
 										$this->redirectQueue[$orig] = $redirectURL;
 									}
 								}
 							}
 							//die($url.' -multi- '.$request->getResponseInfo('effective_url'));
-
-							if (isset($this->cache) && isset($this->requests[$orig]['body'])) {
-								 $this->setCached($orig, $this->requests[$orig]);
-							}
-
-							$pool->detach($request);
+							$pool->dequeue($request);
 							unset($this->requests[$orig]['httpRequest'], $request);
 							/*
 							if ($this->minimiseMemoryUse) {
@@ -434,7 +514,7 @@ class HumbleHttpAgent
 						}
 					}
 				}
-			} catch (HttpException $e) {
+			} catch (http\Exception $e) {
 				$this->debug($e);
 				return false;
 			}
@@ -456,14 +536,17 @@ class HumbleHttpAgent
 					$this->debug("...$url");
 					if (!$isRedirect && isset($this->requests[$url])) {
 						$this->debug("......in memory");
+					/*
 					} elseif ($this->isCached($url)) {
 						$this->debug("......is cached");
 						if (!$this->minimiseMemoryUse) {
 							$this->requests[$url] = $this->getCached($url);
 						}
+					*/
 					} else {
 						$this->debug("......adding to pool");
 						$req_url = $this->rewriteUrls($url);
+						$req_url = $this->convertIdn($req_url);
 						$req_url = ($this->rewriteHashbangFragment) ? $this->rewriteHashbangFragment($req_url) : $req_url;
 						$req_url = $this->removeFragment($req_url);
 						if (!empty($this->headerOnlyTypes) && !isset($this->requests[$orig]['wrongGuess']) && $this->possibleUnsupportedType($req_url)) {
@@ -471,21 +554,54 @@ class HumbleHttpAgent
 						} else {
 							$_meth = 'GET';
 							unset($this->requests[$orig]['wrongGuess']);
-						}						
-						$headers = array();
-						//$headers[] = 'User-Agent: '.$this->userAgent;
-						$headers[] = $this->getUserAgent($req_url);
-						// add referer for picky sites
-						$headers[] = 'Referer: '.$this->referer;
-						// send cookies, if we have any
-						if ($cookies = $this->cookieJar->getMatchingCookies($req_url)) {
-							$this->debug("......sending cookies: $cookies");
-							$headers[] = 'Cookie: '.$cookies;
 						}
-						$httpRequest = new RollingCurlRequest($req_url, $_meth, null, $headers, array(
-							CURLOPT_CONNECTTIMEOUT => $this->requestOptions['timeout'],
-							CURLOPT_TIMEOUT => $this->requestOptions['timeout']
-							));
+						$headers = array();
+
+						// check site config for additional http headers
+						$scHeaders = array();
+						if (isset($this->siteConfigBuilder)) {
+							$scHeaders = $this->siteConfigBuilder->buildSiteConfig($req_url)->http_header;
+						}
+
+						// send cookies, if we have any
+						$_cookies = null;
+						if (isset($scHeaders['cookie'])) {
+							$_cookies = $scHeaders['cookie'];
+						} else { 
+							//$_cookies = $this->cookieJar->getMatchingCookies($req_url);
+							$_cookies = $this->getCookies($orig, $req_url);
+						}
+						if ($_cookies) {
+							$this->debug("......sending cookies: $_cookies");
+							$headers[] = 'Cookie: '.$_cookies;
+						}
+
+						// send user agent
+						$_ua = null;
+						if (isset($scHeaders['user-agent'])) {
+							$_ua = $scHeaders['user-agent'];
+						} else {
+							$_ua = $this->getUserAgent($req_url, true);
+							$_ua = $_ua['User-Agent'];
+						}
+						if ($_ua) {
+							$this->debug("......user-agent set to: $_ua");
+							$headers[] = 'User-Agent: '.$_ua;
+						}
+
+						// add referer for picky sites
+						$_referer = null;
+						if (isset($scHeaders['referer'])) {
+							$_referer = $scHeaders['referer'];
+						} else {
+							$_referer = $this->referer;
+						}
+						if ($_referer) {
+							$this->debug("......referer set to: $_referer");						
+							$headers[] = 'Referer: '.$_referer;
+						}
+
+						$httpRequest = new RollingCurlRequest($req_url, $_meth, null, $headers, $this->curlOptions);
 						$httpRequest->set_original_url($orig);
 						$this->requests[$orig] = array('headers'=>null, 'body'=>null, 'httpRequest'=>$httpRequest);
 						$this->requests[$orig]['original_url'] = $orig; // TODO: is this needed anymore?
@@ -519,8 +635,9 @@ class HumbleHttpAgent
 							if ($this->validateURL($redirectURL)) {
 								$this->debug('Redirect detected. Valid URL: '.$redirectURL);
 								// store any cookies
-								$cookies = $this->cookieJar->extractCookies($this->requests[$orig]['headers']);
-								if (!empty($cookies)) $this->cookieJar->storeCookies($url, $cookies);							
+								//$cookies = $this->cookieJar->extractCookies($this->requests[$orig]['headers']);
+								//if (!empty($cookies)) $this->cookieJar->storeCookies($url, $cookies);
+								$this->storeCookies($orig, $url);
 								$this->redirectQueue[$orig] = $redirectURL;
 							} else {
 								$this->debug('Redirect detected. Invalid URL: '.$redirectURL);
@@ -537,14 +654,11 @@ class HumbleHttpAgent
 							// for AJAX sites, e.g. Blogger with its dynamic views templates.
 							// Based on Google's spec: https://developers.google.com/webmasters/ajax-crawling/docs/specification
 							if (isset($this->requests[$orig]['body'])) {
-								$redirectURL = $this->getRedirectURLfromHTML($this->requests[$orig]['effective_url'], substr($this->requests[$orig]['body'], 0, 4000));
+								$redirectURL = $this->getRedirectURLfromHTML($this->requests[$orig]['effective_url'], substr($this->requests[$orig]['body'], 0, 150000));
 								if ($redirectURL) {
 									$this->redirectQueue[$orig] = $redirectURL;
 								}
 							}
-						}
-						if (isset($this->cache) && isset($this->requests[$orig]['body'])) {
-							$this->setCached($orig, $this->requests[$orig]);
 						}
 						// die($url.' -multi- '.$request->getResponseInfo('effective_url'));
 						unset($this->requests[$orig]['httpRequest'], $this->requests[$orig]['method']);
@@ -575,17 +689,55 @@ class HumbleHttpAgent
 					$this->debug("Sending request for $url");
 					$this->requests[$orig]['original_url'] = $orig;
 					$req_url = $this->rewriteUrls($url);
+					$req_url = $this->convertIdn($req_url);
 					$req_url = ($this->rewriteHashbangFragment) ? $this->rewriteHashbangFragment($req_url) : $req_url;
 					$req_url = $this->removeFragment($req_url);
-					// send cookies, if we have any
 					$httpContext = $this->httpContext;
-					$httpContext['http']['header'] .= $this->getUserAgent($req_url)."\r\n";
-					// add referer for picky sites
-					$httpContext['http']['header'] .= 'Referer: '.$this->referer."\r\n";
-					if ($cookies = $this->cookieJar->getMatchingCookies($req_url)) {
-						$this->debug("......sending cookies: $cookies");
-						$httpContext['http']['header'] .= 'Cookie: '.$cookies."\r\n";
+
+					// check site config for additional http headers
+					$scHeaders = array();
+					if (isset($this->siteConfigBuilder)) {
+						$scHeaders = $this->siteConfigBuilder->buildSiteConfig($req_url)->http_header;
 					}
+
+					// send cookies, if we have any
+					$_cookies = null;
+					if (isset($scHeaders['cookie'])) {
+						$_cookies = $scHeaders['cookie'];
+					} else { 
+						//$_cookies = $this->cookieJar->getMatchingCookies($req_url);
+						$_cookies = $this->getCookies($orig, $req_url);
+					}
+					if ($_cookies) {
+						$this->debug("......sending cookies: $_cookies");
+						$httpContext['http']['header'] .= 'Cookie: '.$_cookies."\r\n";
+					}
+
+					// send user agent
+					$_ua = null;
+					if (isset($scHeaders['user-agent'])) {
+						$_ua = $scHeaders['user-agent'];
+					} else {
+						$_ua = $this->getUserAgent($req_url, true);
+						$_ua = $_ua['User-Agent'];
+					}
+					if ($_ua) {
+						$this->debug("......user-agent set to: $_ua");
+						$httpContext['http']['header'] .= 'User-Agent: '.$_ua."\r\n";
+					}
+
+					// add referer for picky sites
+					$_referer = null;
+					if (isset($scHeaders['referer'])) {
+						$_referer = $scHeaders['referer'];
+					} else {
+						$_referer = $this->referer;
+					}
+					if ($_referer) {
+						$this->debug("......referer set to: $_referer");
+						$httpContext['http']['header'] .= 'Referer: '.$_referer."\r\n";
+					}
+
 					if (false !== ($html = @file_get_contents($req_url, false, stream_context_create($httpContext)))) {
 						$this->debug('Received response');
 						// get status code
@@ -615,8 +767,9 @@ class HumbleHttpAgent
 								if ($this->validateURL($redirectURL)) {
 									$this->debug('Redirect detected. Valid URL: '.$redirectURL);
 									// store any cookies
-									$cookies = $this->cookieJar->extractCookies($this->requests[$orig]['headers']);
-									if (!empty($cookies)) $this->cookieJar->storeCookies($url, $cookies);
+									//$cookies = $this->cookieJar->extractCookies($this->requests[$orig]['headers']);
+									//if (!empty($cookies)) $this->cookieJar->storeCookies($url, $cookies);
+									$this->storeCookies($orig, $url);
 									$this->redirectQueue[$orig] = $redirectURL;
 								} else {
 									$this->debug('Redirect detected. Invalid URL: '.$redirectURL);
@@ -626,7 +779,7 @@ class HumbleHttpAgent
 								// for AJAX sites, e.g. Blogger with its dynamic views templates.
 								// Based on Google's spec: https://developers.google.com/webmasters/ajax-crawling/docs/specification
 								if (isset($this->requests[$orig]['body'])) {
-									$redirectURL = $this->getRedirectURLfromHTML($this->requests[$orig]['effective_url'], substr($this->requests[$orig]['body'], 0, 4000));
+									$redirectURL = $this->getRedirectURLfromHTML($this->requests[$orig]['effective_url'], substr($this->requests[$orig]['body'], 0, 150000));
 									if ($redirectURL) {
 										$this->redirectQueue[$orig] = $redirectURL;
 									}
@@ -645,7 +798,7 @@ class HumbleHttpAgent
 			}
 		}
 	}
-
+	
 	public function handleCurlResponse($response, $info, $request) {
 		$orig = $request->url_original;
 		$this->requests[$orig]['headers'] = substr($response, 0, $info['header_size']);
@@ -703,7 +856,7 @@ class HumbleHttpAgent
 		*/
 		if ($remove && $response) unset($this->requests[$url]);
 		if ($gzdecode && stripos($response['headers'], 'Content-Encoding: gzip')) {
-			if ($html = gzdecode($response['body'])) {
+			if ($html = @gzdecode($response['body'])) {
 				$response['body'] = $html;
 			}
 		}
@@ -711,7 +864,7 @@ class HumbleHttpAgent
 	}
 	
 	public function parallelSupport() {
-		return class_exists('HttpRequestPool') || function_exists('curl_multi_init');
+		return class_exists('http\Client') || function_exists('curl_multi_init');
 	}
 	
 	private function headerOnlyType($headers) {
@@ -734,6 +887,32 @@ class HumbleHttpAgent
 		}
 		return false;
 	}
+
+	protected function getCookies($orig, $req_url) {
+		if (!isset($this->cookieJar[$orig])) return null;
+		$jar = $this->cookieJar[$orig];
+		if (!isset($jar)) {
+			return null;
+		}
+		return $jar->getMatchingCookies($req_url);
+	}
+
+	protected function storeCookies($orig, $url) {
+		$headers = $this->requests[$orig]['headers'];
+		$cookies = CookieJar::extractCookies($headers);
+		if (empty($cookies)) {
+			return;
+		}
+		if (!isset($this->cookieJar[$orig])) {
+			$this->cookieJar[$orig] = new CookieJar();
+		}
+		$this->cookieJar[$orig]->storeCookies($url, $cookies);
+	}
+
+	protected function deleteCookies() {
+		$this->cookieJar = array();
+	}
+
 }
 
 // gzdecode from http://www.php.net/manual/en/function.gzdecode.php#82930
@@ -791,11 +970,11 @@ if (!function_exists('gzdecode')) {
 		if ($flags & 16) {
 			// C-style string COMMENT data in header
 			if ($len - $headerlen - 1 < 8) {
-				return false; // invalid
+				return false;    // invalid
 			}
 			$commentlen = strpos(substr($data,$headerlen),chr(0));
 			if ($commentlen === false || $len - $headerlen - $commentlen - 1 < 8) {
-				return false; // Invalid header format
+				return false;    // Invalid header format
 			}
 			$comment = substr($data,$headerlen,$commentlen);
 			$headerlen += $commentlen + 1;
@@ -804,14 +983,14 @@ if (!function_exists('gzdecode')) {
 		if ($flags & 2) {
 			// 2-bytes (lowest order) of CRC32 on header present
 			if ($len - $headerlen - 2 < 8) {
-				return false; // invalid
+				return false;    // invalid
 			}
 			$calccrc = crc32(substr($data,0,$headerlen)) & 0xffff;
 			$headercrc = unpack("v", substr($data,$headerlen,2));
 			$headercrc = $headercrc[1];
 			if ($headercrc != $calccrc) {
 				$error = "Header checksum failed.";
-				return false; // Bad header CRC
+				return false;    // Bad header CRC
 			}
 			$headerlen += 2;
 		}
@@ -850,4 +1029,3 @@ if (!function_exists('gzdecode')) {
 		return $data;
 	}
 }
-?>

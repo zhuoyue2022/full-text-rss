@@ -24,7 +24,7 @@ $options->enabled = true;
 // Debug mode
 // ----------------------
 // Enable or disable debugging. When enabled debugging works by passing
-// &debug=1 to the makefulltextfeed.php querystring.
+// &debug to the makefulltextfeed.php querystring.
 // Valid values:
 // true or 'user' (default) - let user decide
 // 'admin' - debug works only for logged in admin users
@@ -35,7 +35,7 @@ $options->debug = true;
 // ----------------------
 // The number of feed items to process when no API key is supplied
 // and no &max=x value is supplied in the querystring.
-$options->default_entries = 5;
+$options->default_entries = 10;
 
 // Max entries (without access key)
 // ----------------------
@@ -43,7 +43,7 @@ $options->default_entries = 5;
 // This limits the user-supplied &max=x value. For example, if the user
 // asks for 20 items to be processed (&max=20), if max_entries is set to 
 // 10, only 10 will be processed.
-$options->max_entries = 10;
+$options->max_entries = 30;
 
 // Full content
 // ----------------------
@@ -58,6 +58,19 @@ $options->max_entries = 10;
 // Note: currently this does not disable full content extraction. It simply omits it
 // from the output.
 $options->content = 'user';
+
+// HTML5 output
+// ----------------------
+// Full-Text RSS used to rely on libxml to output HTML extracted from
+// a web page. Since version 3.8 we use HTML5-PHP by default.
+// If you prefer the old output, either set this to false or pass &content=1 
+// in the querystring.
+// 
+// Possible values...
+// HTML5 (slower): true
+// libxml (faster): false
+// HTML5 unless user overrides (&content=1): 'user' (default)
+$options->html5_output = 'user';
 
 // Excerpts
 // ----------------------
@@ -116,6 +129,13 @@ $options->rewrite_relative_urls = true;
 // User decides: 'user' (this option will appear on the form)
 $options->exclude_items_on_fail = 'user';
 
+// Enable single-page support
+// -------------------------
+// If enabled, we will try to follow single page links (e.g. print view) on multi-page articles.
+// Currently this only happens for sites where single_page_link has been defined 
+// in a site config file.
+$options->singlepage = true;
+
 // Enable multi-page support
 // -------------------------
 // If enabled, we will try to follow next page links on multi-page articles.
@@ -123,15 +143,26 @@ $options->exclude_items_on_fail = 'user';
 // in a site config file.
 $options->multipage = true;
 
-// Enable caching
+// Enable disk caching
 // ----------------------
-// Enable this if you'd like to cache results
-// for 10 minutes. Cache files are written to disk (in cache/ subfolders
-// - which must be writable).
+// Enable this if you'd like to cache results on disk.
+// Possible options:
+//  * Disable caching: false (default)
+//  * Enable caching: true
+// Cache files are written to disk (in cache/ subfolders - which must be writable).
 // Initially it's best to keep this disabled to make sure everything works
 // as expected. If you have APC enabled, please also see smart_cache in the
 // advanced section.
 $options->caching = false;
+
+// Cache time (minutes)
+// ----------------------
+// How long should a response be cached?
+// Note: this affects both disk caching and the cache headers
+// sent in the Full-Text RSS HTTP response.
+// So even if you disable disk caching, this value will still
+// affect the cache headers in the HTTP response.
+$options->cache_time = 10;
 
 // Cache directory
 // ----------------------
@@ -169,24 +200,28 @@ $options->keep_enclosures = true;
 // Values will be placed inside the <dc:language> element inside each <item> element
 // Possible values:
 // * Ignore language: 0
-// * Use article/feed metadata (e.g. HTML lang attribute): 1 (default)
+// * Use article/feed metadata (e.g. HTML lang attribute): 1
 // * As above, but guess if not present: 2
 // * Always guess: 3
-// * User decides: 'user' (value of 0-3 can be passed in querystring: e.g. &l=2)
-$options->detect_language = 1;
+// * User decides: 'user' (value of 0-3 can be passed in querystring: e.g. &lang=2, &lang=1 will be default if nothing supplied)
+$options->detect_language = 'user';
 
-// Registration key
+// Allow user-submitted site config in request
 // ---------------
-// The registration key is optional. It is not required to use Full-Text RSS, 
-// and does not affect the normal operation of Full-Text RSS. It is currently 
-// only used on admin pages which help you update site patterns with the 
-// latest version offered by FiveFilters.org. For these admin-related 
-// tasks to complete, we will require a valid registration key.
-// If you would like one, you can purchase the latest version of Full-Text RSS
-// at http://fivefilters.org/content-only/
-// Your registration key will automatically be sent in the confirmation email.
-// Once you have it, simply copy and paste it here.
-$options->registration_key = '';
+// If enabled, a user can submit site config rules directly in the request
+// using the siteconfig request parameter. Disabled (false) by default.
+$options->user_submitted_config = false;
+
+// Remove items identified as native ads?
+// ---------------
+// Many news sites now carry native advertising - articles which have been
+// paid for by a corporation to promote their brand or product.
+// Full-Text RSS can identify such articles in certain sites. If an article
+// is identified as being a native ad, we'll add a <dc:type>Native Ad</dc:type>
+// element to the item. But you can also request that such ads be removed from
+// the output altogether. To do so, set the option below to true.
+// Note: this only has effect when the input URL is a feed, not a web page.
+$options->remove_native_ads = false;
 
 /////////////////////////////////////////////////
 /// RESTRICT ACCESS /////////////////////////////
@@ -201,13 +236,14 @@ $options->registration_key = '';
 // If overriding with an environment variable, separate username and password with a colon, e.g.:
 // ftr_admin_credentials: admin:my-secret-password
 // Example: $options->admin_credentials = array('username'=>'admin', 'password'=>'my-secret-password');
-$options->admin_credentials = array('username'=>'admin0', 'password'=>'admin0');
+$options->admin_credentials = array('username'=>'admin', 'password'=>'');
 
 // URLs to allow
 // ----------------------
 // List of URLs (or parts of a URL) which the service will accept.
 // If the list is empty, all URLs (except those specified in the blocked list below)
 // will be permitted.
+// Note: for feeds, this option applies to both feed URLs and item URLs within those feeds.
 // Empty: array();
 // Non-empty example: array('example.com', 'anothersite.org');
 $options->allowed_urls = array();
@@ -215,8 +251,19 @@ $options->allowed_urls = array();
 // URLs to block
 // ----------------------
 // List of URLs (or parts of a URL) which the service will not accept.
-// Note: this list is ignored if allowed_urls is not empty
+// Note: this list is ignored if allowed_urls is not empty.
+// Note: for feeds, this option applies to both feed URLs and item URLs within those feeds.
 $options->blocked_urls = array();
+
+// Blocked message
+// -----------------------
+// If a request is blocked outright because of the two rules above, this is the message
+// that is shown. Please note:
+//  * If the input URL is a feed and it's not blocked, feed items that are blocked will
+//    be skipped, and this message will not be shown.
+//  * If the input URL itself is blocked (feed or not), we will output this message instead
+//    of producing a feed.
+$options->blocked_message = '<strong>URL blocked</strong>';
 
 // Key holder(s) only?
 // ----------------------
@@ -225,22 +272,6 @@ $options->blocked_urls = array();
 // If set to true, no feed is produced unless a valid
 // key is provided.
 $options->key_required = false;
-
-// Favour item titles in feed
-// ----------------------
-// By default, when processing feeds, we assume item titles in the feed
-// have not been truncated. So after processing web pages, the extracted titles
-// are not used in the generated feed. If you prefer to have extracted titles in 
-// the feed you can either set this to false, in which case we will always favour 
-// extracted titles. Alternatively, if set to 'user' (default) we'll use the 
-// extracted title if you pass '&use_extracted_title' in the querystring.
-// Possible values:
-// * Favour feed titles: true 
-// * Favour extracted titles: false
-// * Favour feed titles with user override: 'user' (default)
-// Note: this has no effect when the input URL is to a web page - in these cases
-// we always use the extracted title in the generated feed.
-$options->favour_feed_titles = 'user';
 
 // Access keys (password protected access)
 // ------------------------------------
@@ -264,12 +295,12 @@ $options->api_keys = array();
 // Default entries (with access key)
 // ----------------------
 // The number of feed items to process when a valid access key is supplied.
-$options->default_entries_with_key = 5;
+$options->default_entries_with_key = 10;
 
 // Max entries (with access key)
 // ----------------------
 // The maximum number of feed items to process when a valid access key is supplied.
-$options->max_entries_with_key = 10;
+$options->max_entries_with_key = 30;
 
 /////////////////////////////////////////////////
 /// ADVANCED OPTIONS ////////////////////////////
@@ -298,23 +329,65 @@ $options->max_entries_with_key = 10;
 //
 // Valid values:
 // true - enabled, all content will be filtered
-// 'user' (default) - user must pass &xss in makefulltextfeed.php querystring to enable
+// 'user' (default) - user must pass &xss=1 in makefulltextfeed.php querystring to enable
 // false - disabled
 $options->xss_filter = 'user';
 
-// Allowed parsers
+// Use effective URL in place of item URL
+// ----------------------
+// When we extract content for feed items, we often end up at a different URL than the
+// one in the original feed. This is often a result of URL shorteners or
+// tracking services being used by the feed publisher. We include the final 
+// (effective) URL we reached to get the content inside the dc:identifier field. 
+// If you enable this, we'll also use this URL in place of the original item URL
+// in the new feed we produce.
+// By default, we keep the original item URL but the user can request the effective
+// URL by passing '&use_effective_url' in the querystring.
+// Possible values:
+// * Use effective URL: true
+// * Keep item URL in original feed: false
+// * Keep item URL unless user requests effective URL: 'user' (default)
+$options->favour_effective_url = 'user';
+
+// Favour item titles in feed
+// ----------------------
+// By default, when processing feeds, we assume item titles in the feed
+// have not been truncated. So after processing web pages, the extracted titles
+// are not used in the generated feed. If you prefer to have extracted titles in 
+// the feed you can either set this to false, in which case we will always favour 
+// extracted titles. Alternatively, if set to 'user' (default) we'll use the 
+// extracted title if you pass '&use_extracted_title' in the querystring.
+// Possible values:
+// * Favour feed titles: true 
+// * Favour extracted titles: false
+// * Favour feed titles with user override: 'user' (default)
+// Note: this has no effect when the input URL is to a web page - in these cases
+// we always use the extracted title in the generated feed.
+$options->favour_feed_titles = 'user';
+
+// Allowed HTML parsers
 // ----------------------
 // Full-Text RSS attempts to use PHP's libxml extension to process HTML.
 // While fast, on some sites it may not always produce good results. 
 // For these sites, you can specify an alternative HTML parser: 
-// parser: html5lib
-// The html5lib parser is bundled with Full-Text RSS.
-// see http://code.google.com/p/html5lib/
+// parser: html5php
+// The html5php parser is bundled with Full-Text RSS.
+// see https://github.com/Masterminds/html5-php
 //
-// To disable HTML parsing with html5lib, you can remove it from this list.
-// By default we allow both: libxml and html5lib.
-$options->allowed_parsers = array('libxml', 'html5lib');
-//$options->allowed_parsers = array('libxml'); //disable html5lib - forcing libxml in all cases
+// To disable HTML parsing with html5php, remove it from this list.
+// By default we allow both libxml and html5php.
+// Note: html5php requires PHP 5.3 or higher. If you're running PHP 5.2, 
+// we'll always use libxml.
+$options->allowed_parsers = array('libxml', 'html5php');
+//$options->allowed_parsers = array('libxml'); //disable html5php - forcing libxml in all cases
+
+// Parser override in querystring
+// ---------------------
+// If enabled, user can pass &parser=html5php to override default parser.
+// Possible values:
+// * false: Don't allow override in querystring
+// * true: Allow (default)
+$options->allow_parser_override = true;
 
 // Enable Cross-Origin Resource Sharing (CORS)
 // ----------------------
@@ -322,6 +395,45 @@ $options->allowed_parsers = array('libxml', 'html5lib');
 // Access-Control-Allow-Origin: *
 // see http://en.wikipedia.org/wiki/Cross-origin_resource_sharing
 $options->cors = false;
+
+// Proxy server(s)
+// ----------------------
+// You can specify proxy servers here and ask Full-Text RSS to 
+// route HTTP requests through these servers.
+// If no proxy server is listed, all requests will be made directly.
+// A proxy server should be given a unique name (key in the array)
+// and as its value another array with key 'host' and, if required, 'auth'.
+//
+// Note: if you're listing proxies so Full-Text RSS randomly chooses one
+// for each request, you can also specify 'direct' as a value to make
+// sure direct requests are randomly made as well.
+$options->proxy_servers = array();
+// For example:
+//$options->proxy_servers = array('example1'=>array('host'=>'127.0.0.1:8888'), 'example2'=>array('host'=>'127.0.0.1:8888', 'auth'=>'user:pass'), 'direct'=>array());
+// If Polipo is installed and you want to use it as a caching proxy, uncomment the following line.
+//$options->proxy_servers = array('polipo'=>array('host'=>'127.0.0.1:8123'));
+
+// Proxy mode
+// ----------------------
+// How the proxy servers above should be used:
+// Possible options:
+// * Disable: false (no proxy will be used)
+// * Named: specify which server should be used (e.g. 'example1')
+// * Random: true (default) a random one from the set above will be used each time Full-Text RSS is called.
+// Note: if no proxy servers are entered in $options->proxy_servers, no proxies will be used.
+$options->proxy = true;
+
+// Proxy override in querystring
+// ----------------------
+// If enabled, user can disable or change the proxy server used.
+// Possible values:
+// * false: Don't allow override in querystring
+// * true: Allow user to disable or choose a proxy through a request parameter, like so...
+//    &proxy=0 to disable
+//    &proxy=1 for default behaviour (see $options->proxy) (default)
+//    &proxy=example1 to specify one of the proxies listed in $options->proxy_servers
+// Note: Only proxy servers listed in the config file can be used.
+$options->allow_proxy_override = true;
 
 // Use APC user cache?
 // ----------------------
@@ -356,22 +468,6 @@ $options->fingerprints = array(
 	// WordPress (self-hosted and hosted)
 	'<meta name="generator" content="WordPress' => array('hostname'=>'fingerprint.wordpress.com', 'head'=>true)
 );
-
-// User Agent strings - mapping domain names
-// ----------------------
-// e.g. $options->user_agents = array('example.org' => 'PHP/5.2');
-$options->user_agents = array( 'lifehacker.com' => 'PHP/5.2',
-							   'gawker.com' => 'PHP/5.2',
-							   'deadspin.com' => 'PHP/5.2',
-							   'kotaku.com' => 'PHP/5.2',
-							   'jezebel.com' => 'PHP/5.2',
-							   'io9.com' => 'PHP/5.2',
-							   'jalopnik.com' => 'PHP/5.2',
-							   'gizmodo.com' => 'PHP/5.2',
-							   '.wikipedia.org' => 'Mozilla/5.2',
-							   '.fok.nl' => 'Googlebot/2.1',
-							   'getpocket.com' => 'PHP/5.2'
-							  );
 
 // URL Rewriting
 // ----------------------
@@ -427,7 +523,7 @@ $options->cache_cleanup = 100;
 /// DO NOT CHANGE ANYTHING BELOW THIS ///////////
 /////////////////////////////////////////////////
 
-if (!defined('_FF_FTR_VERSION')) define('_FF_FTR_VERSION', '3.2');
+if (!defined('_FF_FTR_VERSION')) define('_FF_FTR_VERSION', '3.8');
 
 if (basename(__FILE__) == 'config.php') {
 	if (file_exists(dirname(__FILE__).'/custom_config.php')) {

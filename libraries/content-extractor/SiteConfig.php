@@ -5,10 +5,10 @@
  * Each instance of this class should hold extraction patterns and other directives
  * for a website. See ContentExtractor class to see how it's used.
  * 
- * @version 0.8
- * @date 2013-04-16
+ * @version 1.1
+ * @date 2017-09-25
  * @author Keyvan Minoukadeh
- * @copyright 2013 Keyvan Minoukadeh
+ * @copyright 2017 Keyvan Minoukadeh
  * @license http://www.gnu.org/licenses/agpl-3.0.html AGPL v3
  */
 
@@ -20,9 +20,6 @@ class SiteConfig
 	// Use first matching element as body (0 or more xpath expressions)
 	public $body = array();
 	
-	// Skips entries matching these xpath expressions (0 or more)
-	public $skip_entry = array();
-
 	// Use first matching element as author (0 or more xpath expressions)
 	public $author = array();
 	
@@ -37,14 +34,15 @@ class SiteConfig
 	
 	// Strip images which contain these strings (0 or more) in the src attribute 
 	public $strip_image_src = array();
+
+	// Mark article as a native ad if any of these expressions match (0 or more xpath expressions)
+	public $native_ad_clue = array();
 	
-	// Additional HTTP headers to send
-	// NOT YET USED
+	// Additional HTTP headers to send (associative array)
 	public $http_header = array();
 	
 	// Process HTML with tidy before creating DOM (bool or null if undeclared)
 	public $tidy = null;
-	
 	protected $default_tidy = true; // used if undeclared
 	
 	// Autodetect title/body if xpath expressions fail to produce results.
@@ -63,13 +61,18 @@ class SiteConfig
 	// bool or null if undeclared
 	public $prune = null;
 	protected $default_prune = true; // used if undeclared
-
-	// Converts images to data-URI format
-	public $images_to_datauri = null;
-	protected $default_images_to_datauri = false; // used if undeclared
 	
 	// Test URL - if present, can be used to test the config above
 	public $test_url = array();
+
+	// Test URL contains - one or more snippets of text from the article body.
+	// Used to determine if the extraction rules for the site are still valid (ie. still extracting relevant content)
+	// Keys should be one or more of the test URLs supplied, and value an array of strings to look for.
+	public $test_contains = array();
+
+	// If page contains - XPath expression. Used to determine if the preceding rule gets evaluated or not.
+	// Currently only works with single_page_link.
+	public $if_page_contains = array();	
 	
 	// Single-page link - should identify a link element or URL pointing to the page holding the entire article
 	// This is useful for sites which split their articles across multiple pages. Links to such pages tend to 
@@ -89,6 +92,12 @@ class SiteConfig
 	public $parser = null;
 	protected $default_parser = 'libxml'; // used if undeclared
 	
+	// Insert detected image (currently only og:image) into beginning of extracted article
+	// Only does this if extracted article contains no images
+	// bool or null if undeclared
+	public $insert_detected_image = null;
+	protected $default_insert_detected_image = true; // used if undeclared
+
 	// Strings to search for in HTML before processing begins (used with $replace_string)
 	public $find_string = array();
 	// Strings to replace those found in $find_string before HTML processing begins
@@ -97,10 +106,9 @@ class SiteConfig
 	// the options below cannot be set in the config files which this class represents
 	
 	//public $cache_in_apc = false; // used to decide if we should cache in apc or not
-	public $cache_key = null;
 	public static $debug = false;
 	protected static $apc = false;
-	protected static $config_path;
+	protected static $config_path_custom;
 	protected static $config_path_fallback;
 	protected static $config_cache = array();
 	const HOSTNAME_REGEX = '/^(([a-zA-Z0-9-]*[a-zA-Z0-9])\.)*([A-Za-z0-9-]*[A-Za-z0-9])$/';
@@ -109,7 +117,7 @@ class SiteConfig
 		if (self::$debug) {
 			//$mem = round(memory_get_usage()/1024, 2);
 			//$memPeak = round(memory_get_peak_usage()/1024, 2);
-			echo '* ',$msg,"<br />";
+			echo '* ',$msg;
 			//echo ' - mem used: ',$mem," (peak: $memPeak)\n";
 			echo "\n";
 			ob_flush();
@@ -132,7 +140,13 @@ class SiteConfig
 		self::$apc = $apc;
 		return $apc;
 	}
-	
+
+	// return bool or null
+	public function insert_detected_image($use_default=true) {
+		if ($use_default) return (isset($this->insert_detected_image)) ? $this->insert_detected_image : $this->default_insert_detected_image;
+		return $this->insert_detected_image;
+	}
+
 	// return bool or null
 	public function tidy($use_default=true) {
 		if ($use_default) return (isset($this->tidy)) ? $this->tidy : $this->default_tidy;
@@ -143,12 +157,6 @@ class SiteConfig
 	public function prune($use_default=true) {
 		if ($use_default) return (isset($this->prune)) ? $this->prune : $this->default_prune;
 		return $this->prune;
-	}
-
-	// return bool or null
-	public function images_to_datauri($use_default=true) {
-		if ($use_default) return (isset($this->images_to_datauri)) ? $this->images_to_datauri : $this->default_images_to_datauri;
-		return $this->images_to_datauri;
 	}
 	
 	// return string or null
@@ -164,14 +172,32 @@ class SiteConfig
 	}
 	
 	public static function set_config_path($path, $fallback=null) {
-		self::$config_path = $path;
+		self::$config_path_custom = $path;
 		self::$config_path_fallback = $fallback;
 	}
-	
+
+	protected static function load_cached_merged($host, $exact_host_match) {
+		if ($exact_host_match) {
+			$key = $host.'.merged.ex';
+		} else {
+			$key = $host.'.merged';
+		}
+		return self::load_cached($key);
+	}
+
+	protected static function add_to_cache_merged($host, $exact_host_match, SiteConfig $config=null) {
+		if ($exact_host_match) {
+			$key = $host.'.merged.ex';
+		} else {
+			$key = $host.'.merged';
+		}
+		if (!isset($config)) $config = new SiteConfig();
+		self::add_to_cache($key, $config);
+	}
+
 	public static function add_to_cache($key, SiteConfig $config, $use_apc=true) {
 		$key = strtolower($key);
 		if (substr($key, 0, 4) == 'www.') $key = substr($key, 4);
-		if ($config->cache_key) $key = $config->cache_key;
 		self::$config_cache[$key] = $config;
 		if (self::$apc && $use_apc) {
 			self::debug("Adding site config to APC cache with key sc.$key");
@@ -179,7 +205,21 @@ class SiteConfig
 		}
 		self::debug("Cached site config with key $key");
 	}
-	
+
+	public static function load_cached($key) {
+		$key = strtolower($key);
+		if (substr($key, 0, 4) == 'www.') $key = substr($key, 4);
+		//var_dump('in cache?', $key, self::$config_cache);
+		if (array_key_exists($key, self::$config_cache)) {
+			self::debug("... site config for $key already loaded in this request");
+			return self::$config_cache[$key];
+		} elseif (self::$apc && ($sconfig = apc_fetch("sc.$key"))) {
+			self::debug("... site config for $key found in APCu");
+			return $sconfig;
+		}
+		return false;
+	}
+
 	public static function is_cached($key) {
 		$key = strtolower($key);
 		if (substr($key, 0, 4) == 'www.') $key = substr($key, 4);
@@ -193,19 +233,70 @@ class SiteConfig
 	
 	public function append(SiteConfig $newconfig) {
 		// check for commands where we accept multiple statements (no test_url)
-		foreach (array('skip_entry', 'title', 'body', 'author', 'date', 'strip', 'strip_id_or_class', 'strip_image_src', 'single_page_link', 'single_page_link_in_feed', 'next_page_link', 'http_header') as $var) {
+		foreach (array('title', 'body', 'author', 'date', 'strip', 'strip_id_or_class', 'strip_image_src', 'single_page_link', 'single_page_link_in_feed', 'next_page_link', 'native_ad_clue') as $var) {
+			// append array elements for this config variable from $newconfig to this config
+			//$this->$var = $this->$var + $newconfig->$var;
 			$this->$var = array_unique(array_merge($this->$var, $newconfig->$var));
 		}
-		// check for single statement commands; we do not overwrite existing non null values
-		foreach (array('tidy', 'prune', 'parser', 'autodetect_on_failure') as $var) {
+		// special handling of commands where key is important and config values being appended should not overwrite existing ones
+		foreach (array('http_header') as $var) {
+			$this->$var = array_merge($newconfig->$var, $this->$var);
+		}
+		// special handling of if_page_contains directive
+		foreach (array('single_page_link') as $var) {
+			if (isset($this->if_page_contains[$var]) && isset($newconfig->if_page_contains[$var])) {
+				$this->if_page_contains[$var] = array_merge($newconfig->if_page_contains[$var], $this->if_page_contains[$var]);
+			} elseif (isset($newconfig->if_page_contains[$var])) {
+				$this->if_page_contains[$var] = $newconfig->if_page_contains[$var];
+			}
+		}
+		// check for single statement commands
+		// we do not overwrite existing non null values
+		foreach (array('tidy', 'prune', 'parser', 'autodetect_on_failure', 'insert_detected_image') as $var) {
 			if ($this->$var === null) $this->$var = $newconfig->$var;
 		}
 		// treat find_string and replace_string separately (don't apply array_unique) (thanks fabrizio!)
 		foreach (array('find_string', 'replace_string') as $var) {
+			// append array elements for this config variable from $newconfig to this config
+			//$this->$var = $this->$var + $newconfig->$var;
 			$this->$var = array_merge($this->$var, $newconfig->$var);
 		}
 	}
-	
+
+	// Add test_contains to last test_url
+	public function add_test_contains($test_contains) {
+		if (!empty($this->test_url)) {
+			$test_contains = (string) $test_contains;
+			$key = end($this->test_url);
+			reset($this->test_url);
+			if (isset($this->test_contains[$key])) {
+				$this->test_contains[$key][] = $test_contains;
+			} else {
+				$this->test_contains[$key] = array($test_contains);
+			}
+		}
+	}
+
+	// Add if_page_page_contains
+	// TODO: Expand so it can be used with other rules too
+	public function add_if_page_contains_condition($if_page_contains) {
+		if (!empty($this->single_page_link)) {
+			$if_page_contains = (string) $if_page_contains;
+			$key = end($this->single_page_link);
+			reset($this->single_page_link);
+			$this->if_page_contains['single_page_link'][$key] = $if_page_contains;
+		}
+	}
+
+	public function get_if_page_contains_condition($directive_name, $directive_value) {
+		if (isset($this->if_page_contains[$directive_name])) {
+			if (isset($this->if_page_contains[$directive_name][$directive_value])) {
+				return $this->if_page_contains[$directive_name][$directive_value];
+			}
+		}
+		return null;
+	}
+
 	// returns SiteConfig instance if an appropriate one is found, false otherwise
 	// if $exact_host_match is true, we will not look for wildcard config matches
 	// by default if host is 'test.example.org' we will look for and load '.example.org.txt' if it exists
@@ -213,6 +304,12 @@ class SiteConfig
 		$host = strtolower($host);
 		if (substr($host, 0, 4) == 'www.') $host = substr($host, 4);
 		if (!$host || (strlen($host) > 200) || !preg_match(self::HOSTNAME_REGEX, ltrim($host, '.'))) return false;
+		// got a merged one?
+		$config = self::load_cached_merged($host, $exact_host_match);
+		if ($config) {
+			//self::debug('. returned merged config from a previous request');
+			return $config;
+		}
 		// check for site configuration
 		$try = array($host);
 		// should we look for wildcard matches 
@@ -223,95 +320,92 @@ class SiteConfig
 				$try[] = '.'.implode('.', $split);
 			}
 		}
-		
-		// look for site config file in primary folder
-		self::debug(". looking for site config for $host in primary folder");
+
+		// look for site config file in custom folder
+		self::debug(". looking for site config for $host in custom folder");
+		//var_dump($try);
+		$config = null;
+		$config_std = null;
 		foreach ($try as $h) {
-			if (array_key_exists($h, self::$config_cache)) {
-				self::debug("... site config for $h already loaded in this request");
-				return self::$config_cache[$h];
-			} elseif (self::$apc && ($sconfig = apc_fetch("sc.$h"))) {
-				self::debug("... site config for $h in APC cache");
-				return $sconfig;
-			} elseif (file_exists(self::$config_path."/$h.txt")) {
+			//$h_key = $h.'.'.$key_suffix;
+			$h_key = $h.'.custom';
+			//var_dump($h_key, $h);
+			if ($config = self::load_cached($h_key)) {
+				break;
+			} elseif (file_exists(self::$config_path_custom."/$h.txt")) {
 				self::debug("... found site config ($h.txt)");
-				$file_primary = self::$config_path."/$h.txt";
-				$matched_name = $h;
+				$file_custom = self::$config_path_custom."/$h.txt";
+				$config = self::build_from_file($file_custom);
+				//$matched_name = $h;
 				break;
 			}
 		}
 		
 		// if we found site config, process it
-		if (isset($file_primary)) {
-			$config_lines = file($file_primary, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-			if (!$config_lines || !is_array($config_lines)) return false;
-			$config = self::build_from_array($config_lines);
-			// if APC caching is available and enabled, mark this for cache
-			//$config->cache_in_apc = true;
-			$config->cache_key = $matched_name;
-			
-			// if autodetec on failure is off (on by default) we do not need to look
-			// in secondary folder
-			if (!$config->autodetect_on_failure()) {
-				self::debug('... autodetect on failure is disabled (no other site config files will be loaded)');
-				return $config;
-			}
+		// if autodetec on failure is off (on by default) we do not need to look
+		// in secondary folder
+		if ($config && !$config->autodetect_on_failure()) {
+			self::debug('... autodetect on failure is disabled (no other site config files will be loaded)');
+			self::add_to_cache_merged($host, $exact_host_match, $config);
+			return $config;
 		}
 		
 		// look for site config file in secondary folder
 		if (isset(self::$config_path_fallback)) {
-			self::debug(". looking for site config for $host in secondary folder");
+			self::debug(". looking for site config for $host in standard folder");
 			foreach ($try as $h) {
-				if (file_exists(self::$config_path_fallback."/$h.txt")) {
-					self::debug("... found site config in secondary folder ($h.txt)");
+				if ($config_std = self::load_cached($h)) {
+					break;
+				} elseif (file_exists(self::$config_path_fallback."/$h.txt")) {
+					self::debug("... found site config in standard folder ($h.txt)");
 					$file_secondary = self::$config_path_fallback."/$h.txt";
-					$matched_name = $h;
+					$config_std = self::build_from_file($file_secondary);
 					break;
 				}
-			}
-			if (!isset($file_secondary)) {
-				self::debug("... no site config match in secondary folder");
 			}
 		}
 		
 		// return false if no config file found
-		if (!isset($file_primary) && !isset($file_secondary)) {
+		if (!$config && !$config_std) {
 			self::debug("... no site config match for $host");
+			self::add_to_cache_merged($host, $exact_host_match);
 			return false;
 		}
 		
-		// return primary config if secondary not found
-		if (!isset($file_secondary) && isset($config)) {
-			return $config;
-		}
-		
-		// process secondary config file
-		$config_lines = file($file_secondary, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-		if (!$config_lines || !is_array($config_lines)) {
-			// failed to process secondary
-			if (isset($config)) {
-				// return primary config
-				return $config;
-			} else {
-				return false;
-			}
-		}
-		
-		// merge with primary and return
-		if (isset($config)) {
+		// final config handling
+		$config_final = null;
+		if (!$config_std && $config) {
+			$config_final = $config;
+		// merge with primary
+		} elseif ($config_std && $config) {
 			self::debug('. merging config files');
-			$config->append(self::build_from_array($config_lines));
-			return $config;
+			$config->append($config_std);
+			$config_final = $config;
 		} else {
 			// return just secondary
-			$config = self::build_from_array($config_lines);
+			//$config = self::build_from_array($config_lines);
 			// if APC caching is available and enabled, mark this for cache
 			//$config->cache_in_apc = true;
-			$config->cache_key = $matched_name;
-			return $config;
+			$config_final = $config_std;
 		}
+		self::add_to_cache_merged($host, $exact_host_match, $config_final);
+		return $config_final;
 	}
 	
+	public static function build_from_file($path, $cache=true) {
+		$key = basename($path, '.txt');
+		$config_lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+		if (!$config_lines || !is_array($config_lines)) return false;
+		$config = self::build_from_array($config_lines);
+		if ($cache) self::add_to_cache($key, $config);
+		return $config;
+	}
+
+	public static function build_from_string($string) {
+		$config_lines = explode("\n", $string);
+		return self::build_from_array($config_lines);
+	}
+
 	public static function build_from_array(array $lines) {
 		$config = new SiteConfig();
 		foreach ($lines as $line) {
@@ -326,23 +420,41 @@ class SiteConfig
 			if (count($command) != 2) continue;
 			$val = trim($command[1]);
 			$command = trim($command[0]);
-			if ($command == '' || $val == '') continue;
-			
+			//if ($command == '' || $val == '') continue;
+			// $val can be empty, e.g. replace_string: 
+			if ($command == '') continue;
+
+			// strip_attr is now an alias for strip.
+			// In FTR 3.8 we can strip attributes from elements, not only the elements themselves
+			// e.g. strip: //img/@srcset (removes srcset attribute from all img elements)
+			// but for backward compatibility (to avoid errors with new config files + old version of FTR)
+			// we've introduced strip_attr and we'll recommend using that in our public site config rep.
+			// strip_attr: //img/@srcset
+			if ($command == 'strip_attr') $command = 'strip';
+
 			// check for commands where we accept multiple statements
-			if (in_array($command, array('skip_entry', 'title', 'body', 'author', 'date', 'strip', 'strip_id_or_class', 'strip_image_src', 'single_page_link', 'single_page_link_in_feed', 'next_page_link', 'http_header', 'test_url', 'find_string', 'replace_string'))) {
+			if (in_array($command, array('title', 'body', 'author', 'date', 'strip', 'strip_id_or_class', 'strip_image_src', 'single_page_link', 'single_page_link_in_feed', 'next_page_link', 'native_ad_clue', 'http_header', 'test_url', 'find_string', 'replace_string'))) {
 				array_push($config->$command, $val);
 			// check for single statement commands that evaluate to true or false
-			} elseif (in_array($command, array('images_to_datauri', 'tidy', 'prune', 'autodetect_on_failure'))) {
-				$config->$command = ($val == 'yes' || $val == 'true');
+			} elseif (in_array($command, array('tidy', 'prune', 'autodetect_on_failure', 'insert_detected_image'))) {
+				$config->$command = ($val == 'yes');
 			// check for single statement commands stored as strings
 			} elseif (in_array($command, array('parser'))) {
 				$config->$command = $val;
+			// special treatment for test_contains
+			} elseif (in_array($command, array('test_contains'))) {
+				$config->add_test_contains($val);
+			// special treatment for if_page_contains
+			} elseif (in_array($command, array('if_page_contains'))) {
+				$config->add_if_page_contains_condition($val);
 			// check for replace_string(find): replace
 			} elseif ((substr($command, -1) == ')') && preg_match('!^([a-z0-9_]+)\((.*?)\)$!i', $command, $match)) {
 				if (in_array($match[1], array('replace_string'))) {
-					$command = $match[1];
 					array_push($config->find_string, $match[2]);
-					array_push($config->$command, $val);
+					array_push($config->replace_string, $val);
+				} elseif (in_array($match[1], array('http_header'))) {
+					$_header = strtolower(trim($match[2]));
+					$config->http_header[$_header] = $val;
 				}
 			}
 		}

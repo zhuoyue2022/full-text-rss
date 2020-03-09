@@ -1,9 +1,9 @@
 <?php
 // Update site config files for Full-Text RSS
 // Author: Keyvan Minoukadeh
-// Copyright (c) 2013 Keyvan Minoukadeh
+// Copyright (c) 2015 Keyvan Minoukadeh
 // License: AGPLv3
-// Date: 2013-05-12
+// Date: 2015-06-10
 // More info: http://fivefilters.org/content-only/
 // Help: http://help.fivefilters.org
 
@@ -36,6 +36,8 @@ ini_set("display_errors", 1);
 ////////////////////////////////
 $admin_page = 'update';
 require_once('../config.php');
+require_once('../libraries/humble-http-agent/HumbleHttpAgent.php');
+require_once('../libraries/humble-http-agent/CookieJar.php');
 require_once 'template.php';
 tpl_header('Update site patterns');
 
@@ -129,20 +131,23 @@ if ($_REQUEST['key'] !== $admin_hash) {
 // Check for updates
 //////////////////////////////////
 //$ff_version = @file_get_contents('http://fivefilters.org/content-only/site_config/standard/version.txt');
-$_context = stream_context_create(array('http' => array('user_agent' => 'PHP/5.4')));
-$latest_info_json = @file_get_contents('https://api.github.com/repos/fivefilters/ftr-site-config', false, $_context);
+$http = new HumbleHttpAgent();
+$latest_info_json = $http->get('https://api.github.com/repos/fivefilters/ftr-site-config');
+//$_context = stream_context_create(array('http' => array('user_agent' => 'PHP/5.5'), 'ssl'=>array('verify_peer'=>false)));
+//$latest_info_json = file_get_contents('https://api.github.com/repos/fivefilters/ftr-site-config', false, $_context);
 if (!$latest_info_json) {
 	println("Sorry, couldn't get info on latest site config files. Please try again later or contact us.");
 	exit;
 }
+$latest_info_json = $latest_info_json['body'];
 $latest_info_json = @json_decode($latest_info_json);
 if (!is_object($latest_info_json)) {
 	println("Sorry, couldn't parse JSON from GitHub. Please try again later or contact us.");
 	exit;
 }
-$ff_version = $latest_info_json->updated_at;
+$ff_version = $latest_info_json->pushed_at;
 if ($version == $ff_version) {
-	die('Your site config files are up to date! If you have trouble extracting from a particular site, please email us: help@fivefilters.org');
+	die('Your site config files are up to date!');
 } else {
 	println("Updated site patterns are available (version $ff_version)...");
 }
@@ -166,10 +171,17 @@ if (file_exists($tmp_old_local_dir)) {
 $standard_local_dir = '../site_config/standard/';
 //@copy($latest_remote, $tmp_latest_local);
 //copy() does not appear to fill $http_response_header in certain environments
-@file_put_contents($tmp_latest_local, @file_get_contents($latest_remote));
-$headers = implode("\n", $http_response_header);
+//@file_put_contents($tmp_latest_local, @file_get_contents($latest_remote, false, $_context));
+$latest_remote_response = $http->get($latest_remote);
+if (!is_array($latest_remote_response)) {
+	println("Sorry, something went wrong. Please contact us if the problem persists.");
+	exit;
+}
+@file_put_contents($tmp_latest_local, $latest_remote_response['body']);
+//$headers = implode("\n", $http_response_header);
+$headers = $latest_remote_response['headers'];
 //var_dump($headers); exit;
-if (strpos($headers, 'HTTP/1.0 200') === false) {
+if ((strpos($headers, 'HTTP/1.0 200') === false) && (strpos($headers, 'HTTP/1.1 200') === false)) {
 	println("Sorry, something went wrong. Please contact us if the problem persists.");
 	exit;
 }
@@ -202,6 +214,9 @@ if (class_exists('ZipArchive') && file_exists($tmp_latest_local)) {
 			if ($options->apc && function_exists('apc_delete') && function_exists('apc_cache_info')) {
 				$_apc_data = apc_cache_info('user');
 				foreach ($_apc_data['cache_list'] as $_apc_item) {
+					// APCu keys incompatible with original APC keys, apparently fixed in newer versions, but not in 4.0.4
+					// So let's look for those keys and fix here (key -> info).
+					if (isset($_apc_item['key'])) $_apc_item['info'] = $_apc_item['key'];
 					if (substr($_apc_item['info'], 0, 3) == 'sc.') {
 						apc_delete($_apc_item['info']);
 					}
@@ -230,7 +245,7 @@ function println($txt) {
 }
 
 function rrmdir($dir) {
-    foreach(glob($dir . '/{*.txt,*.php,.*.txt,.*.php,.gitattributes,.gitignore,ftr-site-config-master,README.md}', GLOB_BRACE|GLOB_NOSORT) as $file) {
+    foreach(glob($dir . '/{*.txt,*.php,*.com,.*.txt,.*.php,.*.com,.gitattributes,.gitignore,ftr-site-config-master,README.md}', GLOB_BRACE|GLOB_NOSORT) as $file) {
         if(is_dir($file)) {
             rrmdir($file);
         } else {
