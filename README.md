@@ -8,7 +8,7 @@ This project is cloned and then modified from FiveFilters's latest free version 
 
 - Add supports for [Heroku](https://heroku.com)
 - One-key dployment on [Heroku](https://heroku.com/deploy?template=https://github.com/reycn/full-text-rss) 😊
-- Introduce for [Composer](https://getcomposer.org/)
+- Introduce [Composer](https://getcomposer.org/)
 - Default entries increased to 10(default) / 30(maximum)
 - _site_configs_ updated to latest version (9 March 2020)
 - `.gitignore` added to ignore `custom_config.php`
