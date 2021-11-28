@@ -2,13 +2,13 @@
     "name": "reycn/full-text-rss",
     "description": "This project is cloned and then modified from FiveFilters's latest free version.",
     "require": {
-        "php": "8.0.*",
+        "php": "7.4.*",
         "ext-mbstring": "*",
         "ext-xmlrpc": "*",
         "ext-apcu": "*"
     },
     "require-dev": {
-        "php": "8.0.*"
+        "php": "7.4.*"
     },
     "authors": [{
         "name": "Reynard",
