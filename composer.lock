@@ -13,12 +13,12 @@
     "prefer-stable": false,
     "prefer-lowest": false,
     "platform": {
-        "php": "8.3.*",
+        "php": "7.4.*",
         "ext-mbstring": "*",
         "ext-xmlrpc": "*",
         "ext-apcu": "*"
     },
     "platform-dev": {
-        "php": "8.3.*"
+        "php": "7.4.*"
     }
 }
